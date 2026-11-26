@@ -1,0 +1,274 @@
+openapi: 3.0.3
+info:
+  title: reference-article-service
+  version: 0.1.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: /
+    description: current service origin
+security: []
+tags:
+  - name: articles
+    description: Reference content with one public read and one protected write.
+paths:
+  /api/v1/articles:
+    post:
+      tags: [articles]
+      summary: Create an article
+      operationId: createArticle
+      x-security-decision:
+        exposure: protected
+        rationale: writes change stored content and require a caller identity
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ArticleDraft"
+      responses:
+        "201":
+          description: article created
+          headers:
+            Location:
+              description: URI of the created article
+              required: true
+              schema:
+                type: string
+                format: uri-reference
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Article"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/GatewayTimeout"
+  /api/v1/articles/{slug}:
+    get:
+      tags: [articles]
+      summary: Get an article
+      operationId: getArticle
+      x-security-decision:
+        exposure: public
+        rationale: read-only example content with no identity or private data
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[a-z][a-z0-9-]*$"
+      responses:
+        "200":
+          description: article found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Article"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/GatewayTimeout"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Demonstration bearer credential for the reference example only. A real
+        service replaces this with its own identity design; see
+        docs/first-production-feature.md.
+  schemas:
+    Article:
+      type: object
+      additionalProperties: false
+      required:
+        - slug
+        - title
+        - summary
+      properties:
+        slug:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z][a-z0-9-]*$"
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 500
+    ArticleDraft:
+      type: object
+      additionalProperties: false
+      required:
+        - slug
+        - title
+        - summary
+      properties:
+        slug:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z][a-z0-9-]*$"
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 500
+    Problem:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - type
+        - title
+        - status
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          example: not_found
+        type:
+          type: string
+          format: uri-reference
+          description: Stable URI reference identifying the problem class.
+          example: https://www.rfc-editor.org/rfc/rfc9110#section-15.5.5
+        title:
+          type: string
+          example: not found
+        status:
+          type: integer
+          format: int32
+          example: 404
+        detail:
+          type: string
+          example: article was not found
+        instance:
+          type: string
+          format: uri-reference
+          description: URI reference identifying this occurrence when the service exposes one.
+        request_id:
+          type: string
+          description: Correlation identifier echoed from X-Request-ID.
+          example: 9ccecdfd92c94665a46406f8ba73cd77
+        invalid_params:
+          type: array
+          description: >-
+            Which parts of the request failed validation, following the
+            RFC 9457 extension-member example. Present only on a validation
+            rejection, and never carrying the submitted value.
+          items:
+            $ref: "#/components/schemas/InvalidParam"
+    InvalidParam:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - reason
+      properties:
+        name:
+          type: string
+          description: >-
+            An RFC 6901 JSON pointer for a request-body member, or a
+            `location.name` pair such as `query.limit` for a parameter.
+          example: /slug
+        reason:
+          type: string
+          description: >-
+            Why the contract rejected it. Names the constraint that failed and
+            never echoes the submitted value.
+          example: maximum string length is 64
+  responses:
+    BadRequest:
+      description: request is malformed or invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unauthorized:
+      description: credentials are missing or invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Forbidden:
+      description: credentials are valid but not permitted
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: article was not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Conflict:
+      description: an article with this slug already exists
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    RequestEntityTooLarge:
+      description: request body exceeds configured limit
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    InternalServerError:
+      description: unexpected server failure
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ServiceUnavailable:
+      description: server is temporarily at capacity
+      headers:
+        Retry-After:
+          description: whole seconds before the caller should retry
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    GatewayTimeout:
+      description: request exceeded its time budget
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"

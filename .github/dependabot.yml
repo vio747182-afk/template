@@ -1,0 +1,90 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+
+  # Development tools reach every generated service but ship in none of them, and
+  # CI proves they still work. Monthly keeps the upgrade stream proportional to
+  # what a tool bump actually risks.
+  - package-ecosystem: "gomod"
+    directory: "/tools"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "tools"
+    groups:
+      go-tools:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # The repository's own composite actions pin third-party actions too, and the
+  # entry above covers .github/workflows only. Without these, a SHA moved into a
+  # composite action stops receiving updates while still looking pinned.
+  #
+  # publish-image pins the actions that sign, attest, and scan every published
+  # image, so an unwatched SHA here is a supply-chain gap rather than a stale pin.
+  - package-ecosystem: "github-actions"
+    directory: "/.github/actions/publish-image"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "docker"
+    directory: "/build/docker"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "docker"
+    groups:
+      docker-images:
+        patterns:
+          - "*"
+
+  # profile:database-postgres:start
+  - package-ecosystem: "docker-compose"
+    directory: "/env"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "docker"
+    groups:
+      docker-compose:
+        patterns:
+          - "*"
+  # profile:database-postgres:end

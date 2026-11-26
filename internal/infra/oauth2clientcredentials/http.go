@@ -1,0 +1,57 @@
+package oauth2clientcredentials
+
+// profile:outbound-auth-http:start
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/example/go-service-template-rest/internal/infra/httpclient"
+	"golang.org/x/oauth2"
+)
+
+// HTTPClient is an authenticated fixed-target client. It exposes no credential API.
+type HTTPClient struct {
+	client *http.Client
+}
+
+// HTTP binds this credential owner to one fixed-authority client.
+func (c *Client) HTTP(base *httpclient.Client) (*HTTPClient, error) {
+	if !c.available() || base == nil {
+		return nil, ErrInvalidConfiguration
+	}
+	// The token transport sits between two no-redirect layers: this client and
+	// the bounded one underneath.
+	client := base.StandardClient()
+	client.Transport = &oauth2.Transport{
+		Source: clientTokenSource{client: c},
+		Base:   client.Transport,
+	}
+	return &HTTPClient{client: client}, nil
+}
+
+// Do authenticates one request copy with the current valid token. Token
+// acquisition uses the Client's process context and a five-second timeout;
+// canceling this request does not cancel an in-flight token acquisition.
+func (c *HTTPClient) Do(request *http.Request) (*http.Response, error) {
+	if c == nil || c.client == nil || request == nil || request.URL == nil || hasAuthorization(request.Header) {
+		return nil, ErrInvalidConfiguration
+	}
+	// #nosec G704 -- the OAuth transport delegates to httpclient.Client, which pins authority and checks the resolved address.
+	response, err := c.client.Do(request)
+	if err != nil {
+		return response, fmt.Errorf("send authenticated resource request: %w", err)
+	}
+	return response, nil
+}
+
+func hasAuthorization(header http.Header) bool {
+	for name := range header {
+		if http.CanonicalHeaderKey(name) == "Authorization" {
+			return true
+		}
+	}
+	return false
+}
+
+// profile:outbound-auth-http:end

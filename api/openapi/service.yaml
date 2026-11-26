@@ -1,0 +1,288 @@
+openapi: 3.0.3
+info:
+  title: "go-service-template-rest"
+  version: 0.1.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: /
+    description: current service origin
+security: [{bearerAuth: []}]
+tags:
+  - name: system
+    description: Operational endpoints for liveness and readiness.
+  # profile:inbound-webhooks-standard:start
+  - name: inbound-webhooks
+    description: Durable Standard Webhooks ingress.
+  # profile:inbound-webhooks-standard:end
+paths:
+  /health/live:
+    get:
+      # profile:authn-bearer:start
+      security: []
+      # profile:authn-bearer:end
+      tags: [system]
+      summary: Liveness probe
+      operationId: healthLive
+      x-security-decision:
+        exposure: public
+        rationale: process-only platform liveness endpoint with no dependency details
+      responses:
+        "200":
+          description: ok
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /health/ready:
+    get:
+      # profile:authn-bearer:start
+      security: []
+      # profile:authn-bearer:end
+      tags: [system]
+      summary: Readiness probe
+      operationId: healthReady
+      x-security-decision:
+        exposure: public
+        rationale: platform readiness endpoint exposing only generic ready state
+      responses:
+        "200":
+          description: ready
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          description: not ready
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: not ready
+  # profile:inbound-webhooks-standard:start
+  /webhooks/{endpoint_id}:
+    post:
+      security: []
+      tags: [inbound-webhooks]
+      summary: Receive a Standard Webhooks delivery
+      operationId: receiveWebhook
+      x-security-decision:
+        exposure: public
+        rationale: >-
+          sender authenticates the exact raw body with Standard Webhooks
+          signatures; this is not a browser API and adds no CORS allowance
+      parameters:
+        - name: endpoint_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{1,64}$'
+        - name: Webhook-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+        - name: Webhook-Timestamp
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Webhook-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json: {}
+      responses:
+        "204":
+          description: signed delivery is durably owned for asynchronous processing
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "431":
+          $ref: "#/components/responses/RequestHeaderFieldsTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/GatewayTimeout"
+  # profile:inbound-webhooks-standard:end
+components:
+  # profile:authn-bearer:start
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer access token issued for this API audience.
+  # profile:authn-bearer:end
+  schemas:
+    Problem:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - type
+        - title
+        - status
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          example: bad_request
+        type:
+          type: string
+          format: uri-reference
+          description: Stable URI reference identifying the problem class.
+          example: https://www.rfc-editor.org/rfc/rfc9110#section-15.5.1
+        title:
+          type: string
+          example: bad request
+        status:
+          type: integer
+          format: int32
+          example: 400
+        detail:
+          type: string
+          example: invalid request framing
+        instance:
+          type: string
+          format: uri-reference
+          description: URI reference identifying this occurrence when the service exposes one.
+        request_id:
+          type: string
+          example: 9ccecdfd92c94665a46406f8ba73cd77
+        invalid_params:
+          type: array
+          description: >-
+            Which parts of the request failed validation, following the
+            RFC 9457 extension-member example. Present only on a validation
+            rejection, and never carrying the submitted value.
+          items:
+            $ref: "#/components/schemas/InvalidParam"
+    InvalidParam:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - reason
+      properties:
+        name:
+          type: string
+          description: >-
+            An RFC 6901 JSON pointer for a request-body member, or a
+            `location.name` pair such as `query.limit` for a parameter.
+          example: /slug
+        reason:
+          type: string
+          description: >-
+            Why the contract rejected it. Names the constraint that failed and
+            never echoes the submitted value.
+          example: maximum string length is 64
+  responses:
+    BadRequest:
+      description: request is malformed or invalid
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    # Auth response components are added with the first protected operation, so
+    # this health-only contract carries no unused API surface. That operation must
+    # declare 400, 401, 403, 431, 503, and 504 problem responses;
+    # TestOpenAPIRuntimeContractOperationsDeclareSecurityDecisions enforces them.
+    RequestEntityTooLarge:
+      description: request body exceeds configured limit
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    InternalServerError:
+      description: unexpected server failure
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    # profile:inbound-webhooks-standard:start
+    NotFound:
+      description: endpoint is unknown
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Conflict:
+      description: delivery identity conflicts with another body
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    TooManyRequests:
+      description: caller exceeded the configured rate limit
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    RequestHeaderFieldsTooLarge:
+      description: >-
+        request headers exceed either the listener bound or an
+        application-level credential bound; listener rejections happen before
+        routing and use text/plain, while application rejections use Problem
+        Details
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+        text/plain:
+          schema:
+            type: string
+            example: 431 Request Header Fields Too Large
+    ServiceUnavailable:
+      description: durable acceptance is unavailable
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    GatewayTimeout:
+      description: request budget expired before a response could be committed
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    # profile:inbound-webhooks-standard:end

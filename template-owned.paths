@@ -1,0 +1,120 @@
+# Template-owned portable surface.
+#
+# Except for the two managed settings leaves below, each applicable path is mirrored verbatim from this template into
+# a derived repository by `make template-sync`, including deletions inside
+# listed directories. Harness-specific entries are filtered by the complete
+# `agent_harness` choice in the target's `template.lock`. A service may retain
+# a local `.agents/skills/<name>` sibling
+# only with a `.service-owned` marker; the sync preserves that skill regardless
+# of Git status and keeps its Claude/Qwen discovery links out of the sync commit. It
+# still mirrors and deletes every unmarked template-owned skill. A path may
+# appear here only while its managed content carries no
+# repository-specific content: no service name, no module path, no deployment
+# target, no owner, and no initialization-profile marker. `make
+# template-owned-purity-check` enforces the manifest's structural safety and
+# rejects profile-specific content; broader content portability remains a
+# review responsibility and the sync refuses target-module contamination.
+#
+# Repository-specific instructions belong in the repo-owned documents named in
+# docs/template-sync.md. They are never listed here and the sync never reads or
+# writes them.
+#
+# Syntax: one path per line, relative to the repository root. A trailing slash
+# marks a directory, mirrored recursively with deletions. Blank lines and lines
+# starting with `#` are ignored.
+#
+# Eval catalogs, instruction-eval checks, initializer matrices,
+# template-purity scripts, sync behavior fixtures, service baselines, and CD
+# activation stay in the source or derived repository that owns them.
+
+Makefile
+make/template.mk
+
+.editorconfig
+buf.gen.yaml
+buf.yaml
+
+tools/go.mod
+tools/go.sum
+
+AGENTS.md
+CLAUDE.md
+Grok.md
+QWEN.md
+
+docs/agent-harness.md
+docs/agent-harness/
+docs/benchmarking.md
+docs/benchmarking/
+docs/configuration-source-policy.md
+docs/database-schema.md
+docs/prompt-maintenance.md
+docs/prompt-composition.md
+docs/runtime-executable-migration.md
+docs/skill-authoring.md
+docs/spec-first-workflow.md
+docs/subagent-brief-template.md
+docs/template-sync.md
+docs/spec-first-workflow/
+docs/validation-routing.md
+docs/validation/
+docs/universal-disciplines/
+
+.agents/codex-project.toml
+.agents/role-classes/
+.agents/roles/
+.agents/contracts/
+.agents/skills/
+.claude/agents/
+# Only env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH is template-owned; other JSON is consumer-owned.
+.claude/settings.json
+.codex/agents/
+.cursor/agents/
+.cursor/rules/
+.grok/agents/
+.grok/roles/
+.grok/rules/
+.opencode/.gitignore
+.opencode/agents/
+.opencode/commands/
+.opencode/plugins/
+.opencode/rules/
+.qwen/agents/
+# Only model.maxSubagentDepth is template-owned; other JSON is consumer-owned.
+.qwen/settings.json
+opencode.json
+
+template-owned.paths
+scripts/template-sync.sh
+scripts/template-settings-sync.py
+scripts/agent-roles-sync.sh
+scripts/dev/benchmark.sh
+scripts/harness-skills-sync.sh
+scripts/codex-agents-sync.sh
+scripts/lib/manifest.sh
+scripts/lib/sync-cli.sh
+scripts/integration-init.sh
+scripts/openapi-ref-check.go
+scripts/ci/affected-go-packages.sh
+scripts/ci/changed-surfaces.sh
+scripts/ci/docs-contract-check.sh
+scripts/ci/git-changed-paths.sh
+scripts/ci/golangci-lint.sh
+scripts/ci/install-gitleaks.sh
+scripts/ci/integration-record-ast-common.go
+scripts/ci/integration-record-bootstrap-check.go
+scripts/ci/integration-record-check.sh
+scripts/ci/integration-record-constructor-check.go
+scripts/ci/integration-record-grpc-check.go
+scripts/ci/integration-routing-check.sh
+scripts/ci/measure.sh
+scripts/ci/migration-history-check.sh
+scripts/ci/migration-image-history-check.sh
+scripts/ci/migration-validate.sh
+scripts/ci/native-validation-tool.sh
+scripts/ci/publish-image-metadata.sh
+scripts/ci/runtime-image-build.sh
+scripts/ci/runtime-image-check.sh
+scripts/ci/tools-resolution-check.sh
+scripts/ci/validation-lock.sh
+scripts/ci/verify.sh

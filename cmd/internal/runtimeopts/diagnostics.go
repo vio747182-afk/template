@@ -1,0 +1,148 @@
+package runtimeopts
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/pprof"
+	"strings"
+	"time"
+
+	"github.com/example/go-service-template-rest/internal/config"
+	"github.com/example/go-service-template-rest/internal/infra/telemetry"
+)
+
+// diagnosticsReadHeaderTimeout bounds how long a scraper may take to send its
+// request line and headers. It is the only timeout this listener sets: a scrape
+// is one small request, and a write bound would truncate a slow collector rather
+// than protect anything.
+const diagnosticsReadHeaderTimeout = 5 * time.Second
+
+// diagnosticsServer builds the private listener a background binary serves:
+// process liveness, readiness, the metrics scrape, and gated runtime profiles.
+//
+// It carries no Addr, because callers serve it on a listener they bound
+// themselves and http.Server.Addr is ignored on that path. Binding separately is
+// what makes an address already in use a startup failure rather than a
+// diagnostics server that stopped later for no stated reason.
+//
+// ready is the whole readiness verdict, so a binary with more than one condition
+// combines them at its own call site. That keeps this handler from having to
+// know which conditions exist, and keeps this file from naming binaries a build
+// profile may have removed.
+//
+// cmd/service does not use this server. Its diagnostics listener additionally
+// serves build identity and takes its timeouts from configuration, but it uses
+// [RegisterPprofHandlers] for the same profile-routing contract.
+func diagnosticsServer(ready func() bool, metrics *telemetry.Metrics, pprofEnabled bool) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health/live", func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /health/ready", func(writer http.ResponseWriter, _ *http.Request) {
+		if !ready() {
+			http.Error(writer, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+	})
+	mux.Handle("GET /metrics", metrics.Handler())
+	if pprofEnabled {
+		RegisterPprofHandlers(mux)
+	}
+	return &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: diagnosticsReadHeaderTimeout,
+	}
+}
+
+// RegisterPprofHandlers mounts runtime profiles on an explicitly owned mux.
+// Callers gate this function with runtime configuration and keep the listener
+// private. They must never serve http.DefaultServeMux: importing net/http/pprof
+// registers the same sensitive handlers there as a package side effect.
+func RegisterPprofHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+}
+
+// DiagnosticsListener is a bound and serving diagnostics server. It owns its
+// listener, its serving goroutine, and the join, so a composition root only
+// starts it, watches one channel, and stops it — which is what lets a lifecycle
+// function read as lifecycle instead of as HTTP mechanics.
+type DiagnosticsListener struct {
+	server *http.Server
+	// done closes once Serve has returned and serveErr is written, so serveErr
+	// needs no lock: the close is the only publication of it.
+	done     chan struct{}
+	serveErr error
+}
+
+// RequireDiagnosticsAddr rejects a background binary configured without a
+// diagnostics address before any I/O: its liveness, readiness, and metrics have
+// no other listener.
+func RequireDiagnosticsAddr(addr, component string) error {
+	if strings.TrimSpace(addr) == "" {
+		return fmt.Errorf("%w: %s diagnostics address is required", config.ErrValidate, component)
+	}
+	return nil
+}
+
+// ListenDiagnostics binds the address and begins serving. Binding happens before
+// the goroutine starts, so an address already in use fails startup instead of
+// surfacing later as a diagnostics server that stopped for no stated reason.
+func ListenDiagnostics(
+	ctx context.Context,
+	addr string,
+	component string,
+	ready func() bool,
+	metrics *telemetry.Metrics,
+	pprofEnabled bool,
+) (*DiagnosticsListener, error) {
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen for %s diagnostics: %w", component, err)
+	}
+	served := &DiagnosticsListener{
+		server: diagnosticsServer(ready, metrics, pprofEnabled),
+		done:   make(chan struct{}),
+	}
+	go func() {
+		defer close(served.done)
+		if err := served.server.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
+			served.serveErr = err
+		}
+	}()
+	return served, nil
+}
+
+// Stopped reports a diagnostics server that returned on its own, which is a
+// process-level fault rather than a shutdown: the binary can still do its work,
+// but nothing can scrape it or read its readiness.
+func (d *DiagnosticsListener) Stopped() <-chan struct{} {
+	return d.done
+}
+
+// Stop drains in-flight scrapes until limit expires, then drops whatever is
+// still open, so Serve always returns and the join cannot outlast the budget.
+// A local stage timeout is a degraded success once Close has forced the listener
+// down; a spent parent budget and Close or Serve failures remain errors.
+//
+// parent is the caller's own teardown context, and its deadline still binds:
+// limit is this stage's ceiling, not a fresh budget.
+func (d *DiagnosticsListener) Stop(parent context.Context, limit time.Duration) error {
+	ctx, cancel := context.WithTimeout(parent, limit)
+	defer cancel()
+	shutdownErr := d.server.Shutdown(ctx)
+	closeErr := d.server.Close()
+	<-d.done
+	if parent.Err() == nil && errors.Is(shutdownErr, context.DeadlineExceeded) {
+		shutdownErr = nil
+	}
+	return errors.Join(shutdownErr, closeErr, d.serveErr)
+}

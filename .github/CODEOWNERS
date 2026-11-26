@@ -1,0 +1,9 @@
+# Template users must replace the owner below before requiring code-owner review.
+# Example: * @acme/backend-platform
+* @Dankosik
+
+# Critical areas requiring explicit ownership.
+/api/ @Dankosik
+/internal/ @Dankosik
+/.github/workflows/ @Dankosik
+/migrations/ @Dankosik

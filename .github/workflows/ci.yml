@@ -1,0 +1,809 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: [v*]
+  pull_request:
+    branches: [main]
+  merge_group:
+  schedule:
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+  GOTOOLCHAIN: local
+  VALIDATION_JOBS: 4
+  VALIDATION_PARALLEL_TESTS: 4
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go_source: ${{ steps.surfaces.outputs.go_source }}
+      go_handwritten: ${{ steps.surfaces.outputs.go_handwritten }}
+      go_generated: ${{ steps.surfaces.outputs.go_generated }}
+      go_testdata: ${{ steps.surfaces.outputs.go_testdata }}
+      go_root_dependencies: ${{ steps.surfaces.outputs.go_root_dependencies }}
+      go_tool_dependencies: ${{ steps.surfaces.outputs.go_tool_dependencies }}
+      go_lint_config: ${{ steps.surfaces.outputs.go_lint_config }}
+      openapi: ${{ steps.surfaces.outputs.openapi }}
+      protobuf: ${{ steps.surfaces.outputs.protobuf }}
+      sqlc: ${{ steps.surfaces.outputs.sqlc }}
+      module_initializer: ${{ steps.surfaces.outputs.module_initializer }}
+      integration_initializer: ${{ steps.surfaces.outputs.integration_initializer }}
+      agent_instructions: ${{ steps.surfaces.outputs.agent_instructions }}
+      shell: ${{ steps.surfaces.outputs.shell }}
+      github_workflows: ${{ steps.surfaces.outputs.github_workflows }}
+      dependency_automation: ${{ steps.surfaces.outputs.dependency_automation }}
+      db_integration: ${{ steps.surfaces.outputs.db_integration }}
+      messaging_integration: ${{ steps.surfaces.outputs.messaging_integration }}
+      process_integration: ${{ steps.surfaces.outputs.process_integration }}
+      integration_race: ${{ steps.surfaces.outputs.integration_race }}
+      integration_race_messaging: ${{ steps.surfaces.outputs.integration_race_messaging }}
+      integration_race_outbox: ${{ steps.surfaces.outputs.integration_race_outbox }}
+      integration_race_webhook: ${{ steps.surfaces.outputs.integration_race_webhook }}
+      performance_harness: ${{ steps.surfaces.outputs.performance_harness }}
+      migrations: ${{ steps.surfaces.outputs.migrations }}
+      compose_environment: ${{ steps.surfaces.outputs.compose_environment }}
+      runtime_image: ${{ steps.surfaces.outputs.runtime_image }}
+      image_security: ${{ steps.surfaces.outputs.image_security }}
+      publication_metadata: ${{ steps.surfaces.outputs.publication_metadata }}
+      secret_scanning: ${{ steps.surfaces.outputs.secret_scanning }}
+      documentation: ${{ steps.surfaces.outputs.documentation }}
+      integration_records: ${{ steps.surfaces.outputs.integration_records }}
+      validation_system: ${{ steps.surfaces.outputs.validation_system }}
+      integration_suites: ${{ steps.integration.outputs.suites }}
+      initializer_parts: ${{ steps.initializer.outputs.parts }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Fetch exact comparison base
+        if: >-
+          !startsWith(github.ref, 'refs/tags/') &&
+          github.event_name != 'workflow_dispatch' &&
+          (github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before) != '' &&
+          (github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before) != '0000000000000000000000000000000000000000'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+      - name: Classify changed surfaces
+        id: surfaces
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == schedule ]]; then
+            bash ./scripts/ci/changed-surfaces.sh --all | tee -a "${GITHUB_OUTPUT}" >>"${GITHUB_STEP_SUMMARY}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            bash ./scripts/ci/changed-surfaces.sh --release | tee -a "${GITHUB_OUTPUT}" >>"${GITHUB_STEP_SUMMARY}"
+          elif [[ "${EVENT_NAME}" == workflow_dispatch ]]; then
+            bash ./scripts/ci/changed-surfaces.sh --all | tee -a "${GITHUB_OUTPUT}" >>"${GITHUB_STEP_SUMMARY}"
+          elif [[ -n "${BASE_SHA}" && "${BASE_SHA}" != 0000000000000000000000000000000000000000 ]]; then
+            bash ./scripts/ci/git-changed-paths.sh --diff "${BASE_SHA}" HEAD | bash ./scripts/ci/changed-surfaces.sh --union "${BASE_SHA}" | tee -a "${GITHUB_OUTPUT}" >>"${GITHUB_STEP_SUMMARY}"
+          else
+            bash ./scripts/ci/changed-surfaces.sh --all | tee -a "${GITHUB_OUTPUT}" >>"${GITHUB_STEP_SUMMARY}"
+          fi
+      - name: Select integration suites
+        # Independent suites run as parallel legs of `integration`; each leg
+        # starts its own containers on its own runner. The gRPC process test
+        # gets its own leg, and the messaging producer process test runs only
+        # in `process`, which messaging changes therefore also select.
+        id: integration
+        env:
+          DATABASE: ${{ steps.surfaces.outputs.db_integration }}
+          MESSAGING: ${{ steps.surfaces.outputs.messaging_integration }}
+          PROCESS: ${{ steps.surfaces.outputs.process_integration }}
+          PROCESS_OR_MESSAGING: ${{ steps.surfaces.outputs.process_integration == 'true' || steps.surfaces.outputs.messaging_integration == 'true' }}
+          RACE: ${{ steps.surfaces.outputs.integration_race }}
+          IMAGE: ${{ steps.surfaces.outputs.migrations == 'true' || steps.surfaces.outputs.runtime_image == 'true' || steps.surfaces.outputs.image_security == 'true' }}
+        run: |
+          set -euo pipefail
+          suites=''
+          for pair in "database:${DATABASE}" "messaging:${MESSAGING}" "process:${PROCESS_OR_MESSAGING}" "process-grpc:${PROCESS}" "race:${RACE}" "image:${IMAGE}"; do
+            if [[ ${pair#*:} == true ]]; then suites+="${suites:+,}\"${pair%%:*}\""; fi
+          done
+          printf 'suites=[%s]\n' "${suites}" | tee -a "${GITHUB_OUTPUT}"
+      - name: Select initializer parts
+        # The shared part runs the profile-independent checks and the minimal
+        # profile, which alone resolves tools outside pull requests; the other
+        # selected profiles run as parallel parts of up to four.
+        id: initializer
+        env:
+          MODULE_INITIALIZER: ${{ steps.surfaces.outputs.module_initializer }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${MODULE_INITIALIZER}" != true ]]; then
+            printf 'parts=[]\n' | tee -a "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [[ "${EVENT_NAME}" == pull_request || "${EVENT_NAME}" == merge_group ]]; then
+            selected=$(bash ./scripts/ci/git-changed-paths.sh --diff "${BASE_SHA}" HEAD | bash ./scripts/ci/init-module-contract-check.sh --select-from-files "${BASE_SHA}")
+          else
+            selected=$(bash ./scripts/ci/init-module-contract-check.sh --list-profiles)
+          fi
+          rest=()
+          while IFS= read -r profile; do
+            if [[ -n "${profile}" && "${profile}" != minimal ]]; then rest+=("${profile}"); fi
+          done <<<"${selected}"
+          parts='{"part":"shared","profiles":"minimal"}'
+          for ((i = 0; i < ${#rest[@]}; i += 4)); do
+            parts+=",{\"part\":\"$((i / 4 + 1))\",\"profiles\":\"${rest[*]:i:4}\"}"
+          done
+          printf 'parts=[%s]\n' "${parts}" | tee -a "${GITHUB_OUTPUT}"
+
+  quality:
+    needs: changes
+    if: >-
+      needs.changes.outputs.go_source == 'true' ||
+      needs.changes.outputs.go_testdata == 'true' ||
+      needs.changes.outputs.go_root_dependencies == 'true' ||
+      needs.changes.outputs.go_tool_dependencies == 'true' ||
+      needs.changes.outputs.go_lint_config == 'true' ||
+      needs.changes.outputs.openapi == 'true' ||
+      needs.changes.outputs.protobuf == 'true' ||
+      needs.changes.outputs.sqlc == 'true' ||
+      needs.changes.outputs.integration_initializer == 'true' ||
+      needs.changes.outputs.integration_records == 'true' ||
+      needs.changes.outputs.agent_instructions == 'true' ||
+      needs.changes.outputs.validation_system == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.cache/gomod/root
+      TOOL_GOMODCACHE: ${{ github.workspace }}/.cache/gomod/tools
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Set up Go
+        if: >-
+          needs.changes.outputs.go_source == 'true' ||
+          needs.changes.outputs.go_root_dependencies == 'true' ||
+          needs.changes.outputs.go_tool_dependencies == 'true' ||
+          needs.changes.outputs.go_lint_config == 'true' ||
+          needs.changes.outputs.openapi == 'true' ||
+          needs.changes.outputs.protobuf == 'true' ||
+          needs.changes.outputs.sqlc == 'true' ||
+          needs.changes.outputs.integration_initializer == 'true' ||
+          needs.changes.outputs.integration_records == 'true' ||
+          needs.changes.outputs.validation_system == 'true'
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore root module cache
+        if: steps.setup-go.outcome == 'success'
+        id: root-module-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: go-mod-root-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}
+          # Main saves a missed key from an empty cache: restoring the previous
+          # one carried every superseded module version into each new save.
+          restore-keys: ${{ (github.event_name != 'push' || github.ref != 'refs/heads/main') && format('go-mod-root-{0}-{1}-', runner.os, runner.arch) || '' }}
+      - name: Restore tool module cache
+        if: >-
+          steps.setup-go.outcome == 'success' &&
+          (needs.changes.outputs.go_source == 'true' ||
+           needs.changes.outputs.go_testdata == 'true' ||
+           needs.changes.outputs.go_handwritten == 'true' ||
+           needs.changes.outputs.go_root_dependencies == 'true' ||
+           needs.changes.outputs.go_tool_dependencies == 'true' ||
+           needs.changes.outputs.openapi == 'true' ||
+           needs.changes.outputs.protobuf == 'true' ||
+           needs.changes.outputs.sqlc == 'true' ||
+           needs.changes.outputs.integration_initializer == 'true')
+        id: tool-module-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TOOL_GOMODCACHE }}
+          key: go-mod-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/go.mod', 'tools/go.sum') }}
+          restore-keys: go-mod-tools-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore quality build cache
+        if: >-
+          needs.changes.outputs.go_source == 'true' ||
+          needs.changes.outputs.go_root_dependencies == 'true' ||
+          needs.changes.outputs.go_lint_config == 'true' ||
+          needs.changes.outputs.openapi == 'true' ||
+          needs.changes.outputs.protobuf == 'true' ||
+          needs.changes.outputs.sqlc == 'true' ||
+          needs.changes.outputs.integration_initializer == 'true' ||
+          needs.changes.outputs.integration_records == 'true'
+        id: quality-build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          # The commit in the key lets every push to main save the build it
+          # just did; a key without it was claimed once and never refreshed,
+          # so each run recompiled everything that changed since.
+          key: go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-
+      - name: Set up Node
+        if: needs.changes.outputs.openapi == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Install pinned golangci-lint binary
+        if: >-
+          needs.changes.outputs.go_handwritten == 'true' ||
+          needs.changes.outputs.go_root_dependencies == 'true' ||
+          needs.changes.outputs.go_lint_config == 'true'
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+          install-only: true
+          skip-cache: true
+      - name: Fetch Go comparison base
+        if: >-
+          (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+          (needs.changes.outputs.go_source == 'true' || needs.changes.outputs.go_testdata == 'true' || needs.changes.outputs.go_root_dependencies == 'true' || needs.changes.outputs.go_handwritten == 'true' || needs.changes.outputs.integration_initializer == 'true')
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [[ -n "${BASE_SHA}" && "${BASE_SHA}" != 0000000000000000000000000000000000000000 ]]; then
+            git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+          fi
+      - name: Affected Go packages
+        if: >-
+          (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+          (needs.changes.outputs.go_source == 'true' || needs.changes.outputs.go_testdata == 'true' || needs.changes.outputs.go_root_dependencies == 'true')
+        id: affected-go
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          ROOT_DEPS: ${{ needs.changes.outputs.go_root_dependencies }}
+        run: |
+          set -euo pipefail
+          if [[ "${ROOT_DEPS}" == true || -z "${BASE_SHA}" || "${BASE_SHA}" == 0000000000000000000000000000000000000000 ]]; then
+            {
+              echo "fallback=true"
+              echo "test_packages=./..."
+              echo "lint_packages="
+              echo "format_files="
+            } >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          bash ./scripts/ci/git-changed-paths.sh --diff "${BASE_SHA}" HEAD | bash ./scripts/ci/affected-go-packages.sh | tee /tmp/affected-go.env
+          while IFS='=' read -r name value; do
+            case "${name}" in
+            fallback) printf 'fallback=%s\n' "${value}" ;;
+            format_files) printf 'format_files=%s\n' "${value}" ;;
+            affected_test_packages) printf 'test_packages=%s\n' "${value}" ;;
+            lint_packages) printf 'lint_packages=%s\n' "${value}" ;;
+            esac
+          done </tmp/affected-go.env >>"${GITHUB_OUTPUT}"
+      - name: Go pull-request format and tests
+        if: >-
+          (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+          (needs.changes.outputs.go_source == 'true' || needs.changes.outputs.go_testdata == 'true' || needs.changes.outputs.go_root_dependencies == 'true')
+        env:
+          TEST_PACKAGES: ${{ steps.affected-go.outputs.test_packages }}
+          FORMAT_FILES: ${{ steps.affected-go.outputs.format_files }}
+          FALLBACK: ${{ steps.affected-go.outputs.fallback }}
+        run: |
+          set -euo pipefail
+          if [[ "${FALLBACK}" == true || "${TEST_PACKAGES}" == "./..." ]]; then
+            bash ./scripts/ci/measure.sh quality-pr-format-test -- make fmt-check test-all
+          elif [[ -z "${TEST_PACKAGES}" ]]; then
+            if [[ -n "${FORMAT_FILES}" ]]; then
+              bash ./scripts/ci/measure.sh quality-pr-format -- make fmt-files-check FILES="${FORMAT_FILES}"
+            fi
+            echo "no ordinary Go test packages; applicable integration gates remain selected"
+          elif [[ -n "${FORMAT_FILES}" ]]; then
+            bash ./scripts/ci/measure.sh quality-pr-format-test -- make fmt-files-check FILES="${FORMAT_FILES}" test-package PKG="${TEST_PACKAGES}"
+          else
+            bash ./scripts/ci/measure.sh quality-pr-format-test -- make test-package PKG="${TEST_PACKAGES}"
+          fi
+      - name: Go pull-request lint
+        if: >-
+          (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+          (needs.changes.outputs.go_handwritten == 'true' || needs.changes.outputs.go_root_dependencies == 'true' || needs.changes.outputs.go_lint_config == 'true')
+        env:
+          LINT_CONFIG_CHANGED: ${{ needs.changes.outputs.go_lint_config }}
+          LINT_PACKAGES: ${{ steps.affected-go.outputs.lint_packages }}
+          ROOT_DEPS: ${{ needs.changes.outputs.go_root_dependencies }}
+        run: |
+          if [[ "${LINT_CONFIG_CHANGED}" == true || "${ROOT_DEPS}" == true ]]; then
+            bash ./scripts/ci/measure.sh quality-pr-lint-all -- make lint-all GOLANGCI_LINT=golangci-lint
+          elif [[ -n "${LINT_PACKAGES}" ]]; then
+            bash ./scripts/ci/measure.sh quality-pr-lint -- make lint-pr PKGS="${LINT_PACKAGES}" GOLANGCI_LINT=golangci-lint
+          else
+            echo "no remaining lint packages"
+          fi
+      - name: Go full format and tests
+        if: >-
+          github.event_name != 'pull_request' && github.event_name != 'merge_group' &&
+          (needs.changes.outputs.go_source == 'true' || needs.changes.outputs.go_testdata == 'true' || needs.changes.outputs.go_root_dependencies == 'true')
+        id: go-full-tests
+        run: bash ./scripts/ci/measure.sh quality-main -- make fmt-check test-all
+      - name: Go full lint
+        if: >-
+          github.event_name != 'pull_request' && github.event_name != 'merge_group' &&
+          (needs.changes.outputs.go_handwritten == 'true' || needs.changes.outputs.go_root_dependencies == 'true' || needs.changes.outputs.go_lint_config == 'true')
+        run: bash ./scripts/ci/measure.sh quality-main-lint -- make lint-all GOLANGCI_LINT=golangci-lint
+      - name: Whole-program analysis
+        # Runs on pull requests too: when it ran only on main, its findings
+        # surfaced after merge and kept main red.
+        if: needs.changes.outputs.go_handwritten == 'true'
+        run: bash ./scripts/ci/measure.sh quality-whole-program -- make lint-deep
+      - name: Root dependencies
+        if: needs.changes.outputs.go_root_dependencies == 'true'
+        run: bash ./scripts/ci/measure.sh quality-root-mod -- make root-mod-check
+      - name: Tool dependencies
+        if: needs.changes.outputs.go_tool_dependencies == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* || "${{ github.event_name }}" == workflow_dispatch || "${{ github.event_name }}" == schedule ]]; then
+            bash ./scripts/ci/measure.sh quality-tools -- env TOOLS_RESOLUTION_ALL=1 make tools-dependencies-check
+          elif [[ -n "${BASE_SHA}" && "${BASE_SHA}" != 0000000000000000000000000000000000000000 ]]; then
+            git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+            bash ./scripts/ci/measure.sh quality-tools -- make tools-dependencies-check BASE_REF="${BASE_SHA}"
+          else
+            bash ./scripts/ci/measure.sh quality-tools-mod -- make tools-mod-check
+          fi
+      - name: OpenAPI
+        if: needs.changes.outputs.openapi == 'true'
+        run: bash ./scripts/ci/measure.sh quality-openapi -- make openapi-drift-check openapi-lint openapi-validate
+      - name: OpenAPI runtime
+        if: needs.changes.outputs.openapi == 'true'
+        env:
+          TEST_PACKAGES: ${{ steps.affected-go.outputs.test_packages }}
+          FALLBACK: ${{ steps.affected-go.outputs.fallback }}
+          GO_FULL_TESTS: ${{ steps.go-full-tests.outcome }}
+        run: |
+          if [[ "${GO_FULL_TESTS}" == success ]]; then
+            echo "OpenAPI runtime tests are covered by the full Go tests"
+            exit 0
+          fi
+          if [[ "${FALLBACK}" == true || "${TEST_PACKAGES}" == "./..." ]]; then
+            echo "OpenAPI runtime tests are covered by the module Go tests"
+            exit 0
+          fi
+          case " ${TEST_PACKAGES} " in
+          *" ./internal/openapi "*)
+            case " ${TEST_PACKAGES} " in
+            *" ./internal/infra/http "*)
+              echo "OpenAPI runtime tests are covered by the affected Go package tests"
+              exit 0
+              ;;
+            esac
+            ;;
+          esac
+          bash ./scripts/ci/measure.sh quality-openapi-runtime -- make openapi-runtime-contract-check
+      - name: Protobuf
+        if: needs.changes.outputs.protobuf == 'true'
+        run: bash ./scripts/ci/measure.sh quality-protobuf -- make check-proto
+      - name: SQLC
+        if: needs.changes.outputs.sqlc == 'true'
+        run: bash ./scripts/ci/measure.sh quality-sqlc -- make check-sqlc
+      - name: Integration initializer contract
+        if: needs.changes.outputs.integration_initializer == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == pull_request || "${{ github.event_name }}" == merge_group ]]; then
+            rows=$(bash ./scripts/ci/git-changed-paths.sh --diff "${BASE_SHA}" HEAD | bash ./scripts/ci/integration-init-check.sh --select-from-files | tr '\n' ' ')
+            make integration-init-check INTEGRATION_INIT_ROWS="${rows}"
+          else
+            make integration-init-check
+          fi
+      - name: Integration record parity
+        if: needs.changes.outputs.integration_records == 'true'
+        run: bash ./scripts/ci/measure.sh quality-integration-record -- make integration-record-check
+      - name: Instruction ownership
+        if: needs.changes.outputs.agent_instructions == 'true'
+        run: bash ./scripts/ci/measure.sh quality-instructions -- make check-instructions
+      - name: Validation routing
+        if: needs.changes.outputs.validation_system == 'true'
+        run: bash ./scripts/ci/measure.sh quality-validation-system -- make verify-check changed-surfaces-check validation-lock-self-test affected-go-packages-check
+      - name: Complete root module cache
+        # Every job restores this cache, including integration-tagged builds
+        # that this job's steps do not compile.
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.setup-go.outcome == 'success' &&
+          steps.root-module-cache.outputs.cache-hit != 'true'
+        run: go mod download
+      - name: Save root module cache
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.setup-go.outcome == 'success' &&
+          steps.root-module-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: ${{ steps.root-module-cache.outputs.cache-primary-key }}
+      - name: Save tool module cache
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.setup-go.outcome == 'success' &&
+          steps.tool-module-cache.outcome == 'success' &&
+          steps.tool-module-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TOOL_GOMODCACHE }}
+          key: ${{ steps.tool-module-cache.outputs.cache-primary-key }}
+      - name: Save Go build cache
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.setup-go.outcome == 'success' &&
+          steps.quality-build-cache.outcome == 'success' &&
+          steps.quality-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: ${{ steps.quality-build-cache.outputs.cache-primary-key }}
+      - name: Fetch contract comparison base
+        if: >-
+          github.event_name == 'pull_request' &&
+          (needs.changes.outputs.openapi == 'true' || needs.changes.outputs.protobuf == 'true')
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+      - name: OpenAPI compatibility
+        if: github.event_name == 'pull_request' && needs.changes.outputs.openapi == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git show "${BASE_SHA}:api/openapi/service.yaml" >/tmp/openapi-base.yaml
+          make openapi-breaking BASE_OPENAPI=/tmp/openapi-base.yaml
+      - name: Protobuf compatibility
+        if: github.event_name == 'pull_request' && needs.changes.outputs.protobuf == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: make proto-breaking BASE_REF="${BASE_SHA}"
+
+  initializer:
+    needs: changes
+    if: needs.changes.outputs.initializer_parts != '[]'
+    name: initializer (${{ matrix.part == 'shared' && 'shared checks + ' || '' }}${{ matrix.profiles }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Every part reports its own result; `required` reads the aggregate,
+      # which is success only when every part passed.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.initializer_parts) }}
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.cache/gomod/root
+      TOOL_GOMODCACHE: ${{ github.workspace }}/.cache/gomod/tools
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Set up Go
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore root module cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: go-mod-root-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: go-mod-root-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore tool module cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TOOL_GOMODCACHE }}
+          key: go-mod-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/go.mod', 'tools/go.sum') }}
+          restore-keys: go-mod-tools-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore initializer build cache
+        # Only the shared part saves, on main: tool resolution builds every
+        # pinned tool there, and the cached binaries keep that step short.
+        # A part without that cache starts from the quality build instead.
+        id: build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-build-initializer-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-initializer-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-build-initializer-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-
+            go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-
+      - name: Module initializer contract
+        env:
+          INIT_MODULE_PROFILES: ${{ matrix.profiles }}
+          INIT_MODULE_SHARED_CHECKS: ${{ matrix.part == 'shared' && '1' || '0' }}
+          INIT_MODULE_RESOLVE_TOOLS: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && '1' || '' }}
+          ROUTE: initializer-${{ matrix.part }}
+        run: bash ./scripts/ci/measure.sh "${ROUTE}" -- make template-init-check
+      - name: Save initializer build cache
+        if: >-
+          matrix.part == 'shared' &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
+  security:
+    needs: changes
+    if: >-
+      needs.changes.outputs.go_handwritten == 'true' ||
+      needs.changes.outputs.go_root_dependencies == 'true' ||
+      (github.event_name == 'pull_request' && (
+        needs.changes.outputs.go_tool_dependencies == 'true' ||
+        needs.changes.outputs.github_workflows == 'true' ||
+        needs.changes.outputs.runtime_image == 'true'
+      ))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.cache/gomod/root
+      TOOL_GOMODCACHE: ${{ github.workspace }}/.cache/gomod/tools
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        if: needs.changes.outputs.go_handwritten == 'true' || needs.changes.outputs.go_root_dependencies == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore security module cache
+        if: needs.changes.outputs.go_handwritten == 'true' || needs.changes.outputs.go_root_dependencies == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: go-mod-root-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: go-mod-root-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore security tool cache
+        if: needs.changes.outputs.go_handwritten == 'true' || needs.changes.outputs.go_root_dependencies == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TOOL_GOMODCACHE }}
+          key: go-mod-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/go.mod', 'tools/go.sum') }}
+          restore-keys: go-mod-tools-${{ runner.os }}-${{ runner.arch }}-
+      - name: Dependency review
+        if: >-
+          github.event_name == 'pull_request' && (
+            needs.changes.outputs.go_root_dependencies == 'true' ||
+            needs.changes.outputs.go_tool_dependencies == 'true' ||
+            needs.changes.outputs.github_workflows == 'true' ||
+            needs.changes.outputs.runtime_image == 'true'
+          )
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
+      - name: Reachable Go vulnerabilities
+        if: needs.changes.outputs.go_handwritten == 'true' || needs.changes.outputs.go_root_dependencies == 'true'
+        run: bash ./scripts/ci/measure.sh security-govulncheck -- make govulncheck
+      - name: Go source security
+        if: >-
+          needs.changes.outputs.go_handwritten == 'true' &&
+          (needs.changes.outputs.go_lint_config == 'true' ||
+            (github.event_name != 'pull_request' && github.event_name != 'merge_group'))
+        run: bash ./scripts/ci/measure.sh security-gosec -- make gosec
+
+  secrets:
+    needs: changes
+    if: github.event_name != 'schedule' || needs.changes.outputs.secret_scanning == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install pinned Gitleaks binary
+        run: bash ./scripts/ci/install-gitleaks.sh "${RUNNER_TEMP}/bin"
+      - name: Secret scan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          GITLEAKS: ${{ runner.temp }}/bin/gitleaks
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* || "${{ github.event_name }}" == workflow_dispatch || -z "${BASE_SHA}" || "${BASE_SHA}" == 0000000000000000000000000000000000000000 ]]; then
+            make secret-scan-history GITLEAKS="${GITLEAKS}"
+          else
+            make secret-scan BASE_REF="${BASE_SHA}" GITLEAKS="${GITLEAKS}"
+          fi
+
+  delivery:
+    needs: changes
+    if: >-
+      needs.changes.outputs.shell == 'true' ||
+      needs.changes.outputs.github_workflows == 'true' ||
+      needs.changes.outputs.performance_harness == 'true' ||
+      needs.changes.outputs.runtime_image == 'true' ||
+      needs.changes.outputs.compose_environment == 'true' ||
+      needs.changes.outputs.publication_metadata == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Workflows
+        if: needs.changes.outputs.github_workflows == 'true'
+        run: bash ./scripts/ci/measure.sh delivery-actionlint -- make actionlint
+      - name: Shell
+        if: needs.changes.outputs.shell == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* || "${{ github.event_name }}" == workflow_dispatch || -z "${BASE_SHA}" || "${BASE_SHA}" == 0000000000000000000000000000000000000000 ]]; then
+            bash ./scripts/ci/measure.sh delivery-shellcheck -- make shellcheck
+          else
+            git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+            bash ./scripts/ci/measure.sh delivery-shellcheck -- env SHELL_FILES="$(git diff --name-only "${BASE_SHA}" HEAD -- '*.sh' | while IFS= read -r file; do [[ -f "${file}" ]] && printf '%s ' "${file}"; done)" make shellcheck
+          fi
+      - name: Performance harness
+        if: needs.changes.outputs.performance_harness == 'true'
+        run: bash ./scripts/ci/measure.sh delivery-performance -- make performance-harness-check
+      - name: Publication metadata
+        if: needs.changes.outputs.publication_metadata == 'true'
+        run: bash ./scripts/ci/measure.sh delivery-publication-metadata -- make publish-image-metadata-check
+      - name: Compose environment
+        if: needs.changes.outputs.compose_environment == 'true'
+        run: bash ./scripts/ci/measure.sh delivery-compose -- make compose-environment-check
+      - name: Dockerfile
+        if: needs.changes.outputs.runtime_image == 'true'
+        run: bash ./scripts/ci/measure.sh delivery-dockerfile -- make dockerfile-check
+
+  integration:
+    needs: changes
+    if: needs.changes.outputs.integration_suites != '[]'
+    name: integration (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      # Every selected suite reports its own result; `required` reads the
+      # aggregate, which is success only when every leg passed.
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.changes.outputs.integration_suites) }}
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.cache/gomod/root
+      TOOL_GOMODCACHE: ${{ github.workspace }}/.cache/gomod/root
+      TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+      NEEDS_GO_INTEGRATION: ${{ needs.changes.outputs.db_integration == 'true' || needs.changes.outputs.messaging_integration == 'true' || needs.changes.outputs.process_integration == 'true' || needs.changes.outputs.integration_race == 'true' || needs.changes.outputs.migrations == 'true' || needs.changes.outputs.runtime_image == 'true' || needs.changes.outputs.image_security == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ (matrix.suite == 'image' && needs.changes.outputs.migrations == 'true') && '0' || '1' }}
+      - name: Migration history
+        if: matrix.suite == 'image' && needs.changes.outputs.migrations == 'true'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${BASE_REF}" && "${BASE_REF}" != 0000000000000000000000000000000000000000 ]]; then
+            MIGRATION_HISTORY_MODE=exact-base BASE_REF="${BASE_REF}" HEAD_REF=HEAD make migration-history-check
+          else
+            make migration-history-check
+          fi
+      - name: Set up Go
+        if: env.NEEDS_GO_INTEGRATION == 'true'
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore integration module cache
+        if: env.NEEDS_GO_INTEGRATION == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: go-mod-root-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: go-mod-root-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore integration build cache
+        if: matrix.suite != 'race' && (matrix.suite != 'image' || needs.changes.outputs.migrations == 'true')
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          # The commit in the key lets every push to main save the build it
+          # just did; a key without it was claimed once and never refreshed,
+          # so each run recompiled everything that changed since.
+          key: go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-
+      - name: Restore race build cache
+        # -race builds share nothing with the cache quality saves, so the race
+        # leg keeps its own; without it most of the leg was compilation.
+        if: matrix.suite == 'race'
+        id: race-build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-build-race-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-race-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-build-race-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-
+      - name: Set up Buildx
+        if: matrix.suite == 'image'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Database integration
+        if: matrix.suite == 'database'
+        run: bash ./scripts/ci/measure.sh integration-db -- env REQUIRE_DOCKER=1 make test-integration-db
+      - name: Messaging integration
+        if: matrix.suite == 'messaging'
+        run: bash ./scripts/ci/measure.sh integration-messaging -- env REQUIRE_DOCKER=1 make test-integration-messaging INTEGRATION_SKIP='^TestNATS.*Process'
+      - name: Process integration
+        if: matrix.suite == 'process'
+        run: bash ./scripts/ci/measure.sh integration-process -- env REQUIRE_DOCKER=1 make test-integration-process INTEGRATION_SKIP='^TestGRPCProcessLifecycle'
+      - name: gRPC process integration
+        if: matrix.suite == 'process-grpc'
+        run: bash ./scripts/ci/measure.sh integration-process-grpc -- env REQUIRE_DOCKER=1 make test-integration-process INTEGRATION_RUN='^TestGRPCProcessLifecycle'
+      - name: Messaging integration race
+        if: matrix.suite == 'race' && needs.changes.outputs.integration_race_messaging == 'true'
+        run: bash ./scripts/ci/measure.sh integration-race-messaging -- env REQUIRE_DOCKER=1 make test-messaging-race
+      - name: Outbox integration race
+        if: matrix.suite == 'race' && needs.changes.outputs.integration_race_outbox == 'true'
+        run: bash ./scripts/ci/measure.sh integration-race-outbox -- env REQUIRE_DOCKER=1 make test-outbox-race
+      - name: Webhook integration race
+        if: matrix.suite == 'race' && needs.changes.outputs.integration_race_webhook == 'true'
+        run: bash ./scripts/ci/measure.sh integration-race-webhook -- env REQUIRE_DOCKER=1 make test-webhook-race
+      - name: Legacy aggregate integration race
+        if: >-
+          matrix.suite == 'race' &&
+          needs.changes.outputs.integration_race == 'true' &&
+          needs.changes.outputs.integration_race_messaging != 'true' &&
+          needs.changes.outputs.integration_race_outbox != 'true' &&
+          needs.changes.outputs.integration_race_webhook != 'true'
+        run: bash ./scripts/ci/measure.sh integration-race-legacy -- env REQUIRE_DOCKER=1 make test-integration-race
+      - name: Production image
+        if: matrix.suite == 'image'
+        env:
+          APP_VERSION: sha-${{ github.sha }}
+          VCS_REF: ${{ github.sha }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          RUNTIME_IMAGE_CACHE_FROM: type=gha,scope=runtime-image
+          RUNTIME_IMAGE_CACHE_TO: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'type=gha,mode=max,scope=runtime-image' || '' }}
+        run: bash ./scripts/ci/measure.sh integration-image-build -- make runtime-image-build RUNTIME_IMAGE=service:ci
+      - name: Runtime image lifecycle
+        if: matrix.suite == 'image' && needs.changes.outputs.runtime_image == 'true' && needs.changes.outputs.migrations != 'true'
+        run: bash ./scripts/ci/measure.sh integration-image-lifecycle -- make runtime-image-check RUNTIME_IMAGE=service:ci RUNTIME_EXPECTED_VERSION="sha-${GITHUB_SHA}"
+      - name: Migration rehearsal
+        if: matrix.suite == 'image' && needs.changes.outputs.migrations == 'true'
+        run: bash ./scripts/ci/measure.sh integration-migration-rehearsal -- make migration-validate RUNTIME_IMAGE=service:ci RUNTIME_EXPECTED_VERSION="sha-${GITHUB_SHA}"
+      - name: Image vulnerabilities
+        if: matrix.suite == 'image' && needs.changes.outputs.image_security == 'true'
+        run: bash ./scripts/ci/measure.sh integration-image-security -- make container-security CONTAINER_IMAGE=service:ci
+      - name: Save race build cache
+        # The weekly run also saves it: race owners rarely change on main.
+        if: >-
+          matrix.suite == 'race' &&
+          (github.event_name == 'push' || github.event_name == 'schedule') &&
+          github.ref == 'refs/heads/main' &&
+          steps.race-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: ${{ steps.race-build-cache.outputs.cache-primary-key }}
+
+  required:
+    if: always()
+    needs: [changes, quality, security, secrets, delivery, integration, initializer]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Reject failed or cancelled gates
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - name: Accept passed and intentionally skipped gates
+        run: echo "all applicable CI gates passed"

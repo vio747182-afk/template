@@ -1,0 +1,156 @@
+package config
+
+// profile:authn-bearer:start
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/example/go-service-template-rest/internal/authntrust"
+)
+
+// AuthnConfig names the immutable issuer boundary. Cryptographic, cache, size,
+// and time policy is fixed by the capability rather than provider-controlled
+// configuration.
+type AuthnConfig struct {
+	Issuer   string `koanf:"issuer"`
+	Audience string `koanf:"audience"`
+	// profile:authn-oidc-jwt:start
+	TokenProfile string `koanf:"token_profile"`
+	// profile:authn-oidc-jwt:end
+	// profile:authn-oidc-introspection:start
+	IntrospectionEndpoint          string `koanf:"introspection_endpoint"`
+	IntrospectionTargetClass       string `koanf:"introspection_target_class"`
+	IntrospectionPrivateHostSuffix string `koanf:"introspection_private_host_suffix"`
+	IntrospectionClientID          string `koanf:"introspection_client_id"`
+	IntrospectionClientSecret      string `koanf:"introspection_client_secret"`
+	// profile:authn-oidc-introspection:end
+}
+
+func authnDefaults() map[string]any {
+	// Trust policy has no executable placeholder. OIDC profiles fail config
+	// validation until deployment supplies every required value.
+	return map[string]any{
+		"authn.issuer":   "",
+		"authn.audience": "",
+		// profile:authn-oidc-jwt:start
+		"authn.token_profile": authntrust.TokenProfileResourceServer,
+		// profile:authn-oidc-jwt:end
+		// profile:authn-oidc-introspection:start
+		"authn.introspection_endpoint":            "",
+		"authn.introspection_target_class":        "",
+		"authn.introspection_private_host_suffix": "",
+		"authn.introspection_client_id":           "",
+		"authn.introspection_client_secret":       "",
+		// profile:authn-oidc-introspection:end
+	}
+}
+
+// validateAuthnConfig applies the shared trust rules at configuration load, so a
+// bad issuer, audience, or token profile stops the process instead of surfacing at
+// authn startup. internal/authntrust owns the rules and why they live in a leaf
+// package: this one may not import the verifier that applies them too.
+func validateAuthnConfig(cfg *AuthnConfig) error {
+	cfg.Issuer = strings.TrimSpace(cfg.Issuer)
+	cfg.Audience = strings.TrimSpace(cfg.Audience)
+	// profile:authn-oidc-jwt:start
+	cfg.TokenProfile = strings.ToLower(strings.TrimSpace(cfg.TokenProfile))
+	// profile:authn-oidc-jwt:end
+
+	if !authntrust.ValidIssuerURL(cfg.Issuer) {
+		return fmt.Errorf(
+			"%w: authn.issuer must be an absolute HTTPS URL without user info, query, or fragment",
+			ErrValidate,
+		)
+	}
+	if cfg.Audience == "" {
+		return fmt.Errorf("%w: authn.audience cannot be empty", ErrValidate)
+	}
+
+	// profile:authn-oidc-jwt:start
+	if !authntrust.ValidTokenProfile(cfg.TokenProfile) {
+		return fmt.Errorf(
+			"%w: authn.token_profile must be one of resource-server or rfc9068",
+			ErrValidate,
+		)
+	}
+	// profile:authn-oidc-jwt:end
+	// profile:authn-oidc-introspection:start
+	// profile:authn-oidc-jwt:start
+	if introspectionConfigured(cfg) {
+		// profile:authn-oidc-jwt:end
+		if err := validateIntrospectionConfig(cfg); err != nil {
+			return err
+		}
+		// profile:authn-oidc-jwt:start
+	}
+	// profile:authn-oidc-jwt:end
+	// profile:authn-oidc-introspection:end
+	return nil
+}
+
+func validateAuthnHTTPCompatibility(cfg HTTPConfig) error {
+	if cfg.MaxInFlight == 0 {
+		return fmt.Errorf("%w: authn OIDC profile requires http.max_in_flight > 0", ErrValidate)
+	}
+	return nil
+}
+
+// profile:grpc:start
+
+func validateAuthnGRPCCompatibility(cfg GRPCConfig) error {
+	if cfg.Server.Enabled && cfg.Server.TransportSecurity != GRPCTransportSecurityTLS {
+		return fmt.Errorf(
+			"%w: authn OIDC profile requires grpc.server.transport_security=tls",
+			ErrValidate,
+		)
+	}
+	return nil
+}
+
+// profile:grpc:end
+
+// profile:authn-oidc-introspection:start
+
+// profile:authn-oidc-jwt:start
+func introspectionConfigured(cfg *AuthnConfig) bool {
+	return cfg.IntrospectionEndpoint != "" ||
+		cfg.IntrospectionTargetClass != "" ||
+		cfg.IntrospectionPrivateHostSuffix != "" ||
+		cfg.IntrospectionClientID != "" ||
+		cfg.IntrospectionClientSecret != ""
+}
+
+// profile:authn-oidc-jwt:end
+
+func validateIntrospectionConfig(cfg *AuthnConfig) error {
+	if !authntrust.ValidIntrospectionEndpoint(cfg.IntrospectionEndpoint) {
+		return fmt.Errorf(
+			"%w: authn.introspection_endpoint must be an absolute HTTPS URL without user info, query, or fragment",
+			ErrValidate,
+		)
+	}
+	switch authntrust.IntrospectionTargetPolicyIssue(cfg.IntrospectionTargetClass, cfg.IntrospectionPrivateHostSuffix) {
+	case authntrust.IntrospectionTargetValid:
+	case authntrust.IntrospectionTargetClassInvalid:
+		return fmt.Errorf(
+			"%w: authn.introspection_target_class must be one of external-https or private-https",
+			ErrValidate,
+		)
+	case authntrust.IntrospectionPrivateSuffixRequired:
+		return fmt.Errorf("%w: authn.introspection_private_host_suffix is required for private-https", ErrValidate)
+	case authntrust.IntrospectionPrivateSuffixForbidden:
+		return fmt.Errorf("%w: authn.introspection_private_host_suffix is forbidden for external-https", ErrValidate)
+	}
+	if cfg.IntrospectionClientID == "" {
+		return fmt.Errorf("%w: authn.introspection_client_id cannot be empty", ErrValidate)
+	}
+	if cfg.IntrospectionClientSecret == "" {
+		return fmt.Errorf("%w: authn.introspection_client_secret cannot be empty", ErrValidate)
+	}
+	return nil
+}
+
+// profile:authn-oidc-introspection:end
+
+// profile:authn-bearer:end

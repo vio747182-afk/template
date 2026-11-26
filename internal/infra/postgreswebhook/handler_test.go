@@ -1,0 +1,43 @@
+package postgreswebhook
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/riverqueue/river"
+)
+
+func TestWebhookDeliveryClassification(t *testing.T) {
+	tests := []struct {
+		name      string
+		result    sendResult
+		err       error
+		cancelled bool
+		retry     bool
+	}{
+		{name: "accepted", result: sendResult{Evidence: transportEvidence{StatusCode: http.StatusNoContent, Certainty: sendCertaintyMayHaveSent}}},
+		{name: "rate limited", result: sendResult{Evidence: transportEvidence{StatusCode: http.StatusTooManyRequests, Certainty: sendCertaintyMayHaveSent}}, retry: true},
+		{name: "rejected", result: sendResult{Evidence: transportEvidence{StatusCode: http.StatusBadRequest, Certainty: sendCertaintyMayHaveSent}}, cancelled: true},
+		{name: "ambiguous", result: sendResult{Evidence: transportEvidence{Certainty: sendCertaintyMayHaveSent}}, retry: true},
+		{name: "local denial", result: sendResult{Evidence: transportEvidence{Certainty: sendCertaintyDefinitelyNotSent, LocalPermanent: true}}, cancelled: true},
+		{name: "deadline", result: sendResult{Evidence: transportEvidence{Certainty: sendCertaintyDefinitelyNotSent}}, err: context.DeadlineExceeded, retry: true},
+		{name: "unspecified", result: sendResult{}, err: errors.New("transport unavailable"), retry: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := classifyDelivery(test.result, test.err)
+			_, cancelled := errors.AsType[*river.JobCancelError](err)
+			if cancelled != test.cancelled {
+				t.Fatalf("cancelled = %t, want %t; error = %v", cancelled, test.cancelled, err)
+			}
+			if test.retry && err == nil {
+				t.Fatal("retryable classification returned nil")
+			}
+			if !test.retry && !test.cancelled && err != nil {
+				t.Fatalf("successful classification error = %v", err)
+			}
+		})
+	}
+}

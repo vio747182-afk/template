@@ -1,0 +1,224 @@
+package bootstrap
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/example/go-service-template-rest/internal/config"
+	"github.com/example/go-service-template-rest/internal/config/configtest"
+	"github.com/example/go-service-template-rest/internal/infra/natsjs"
+	"github.com/example/go-service-template-rest/internal/infra/telemetry/telemetrytest"
+)
+
+func TestMessagingCompositionRejectsEmptyHandlerBeforeConfig(t *testing.T) {
+	if err := run(t.Context(), []string{"--config", "/does/not/exist"}, nil); !errors.Is(err, natsjs.ErrRejected) {
+		t.Fatalf("run(nil handler builder) error = %v, want ErrRejected", err)
+	}
+}
+
+func TestMessagingCompositionRejectsDisabledTransportWithRegisteredHandler(t *testing.T) {
+	configtest.IsolateEnv(t)
+	// profile:authn-oidc-jwt:start
+	t.Setenv("APP__AUTHN__ISSUER", "https://issuer.example.com")
+	t.Setenv("APP__AUTHN__AUDIENCE", "https://api.example.com")
+	// profile:authn-oidc-jwt:end
+	built := false
+	err := run(t.Context(), nil, func(context.Context, config.Config, *slog.Logger) (*natsjs.Registry, func(context.Context), error) {
+		built = true
+		return nil, nil, nil
+	})
+	if !errors.Is(err, config.ErrValidate) || !strings.Contains(err.Error(), "messaging must be enabled for worker") {
+		t.Fatalf("run(disabled messaging) error = %v, want disabled ErrValidate", err)
+	}
+	if built {
+		t.Fatal("worker built the feature handler while messaging was disabled")
+	}
+}
+
+func TestMessagingCompositionRejectsShutdownBudgetWithoutCleanupTail(t *testing.T) {
+	configtest.IsolateEnv(t)
+	// profile:authn-oidc-jwt:start
+	t.Setenv("APP__AUTHN__ISSUER", "https://issuer.example.com")
+	t.Setenv("APP__AUTHN__AUDIENCE", "https://api.example.com")
+	// profile:authn-oidc-jwt:end
+	t.Setenv("APP__HTTP__GRACE_PERIOD", "25s")
+	t.Setenv("APP__HTTP__SHUTDOWN_TIMEOUT", "25s")
+	t.Setenv("APP__HTTP__READINESS_PROPAGATION_DELAY", "0s")
+
+	err := run(t.Context(), nil, func(context.Context, config.Config, *slog.Logger) (*natsjs.Registry, func(context.Context), error) {
+		return nil, nil, nil
+	})
+	if !errors.Is(err, config.ErrValidate) || !strings.Contains(err.Error(), "post-drain teardown budget") {
+		t.Fatalf("run(unreserved shutdown budget) error = %v, want ErrValidate naming the cleanup tail", err)
+	}
+}
+
+func TestMessagingCompositionParsesWorkerBounds(t *testing.T) {
+	cfg := config.MessagingConfig{
+		MaxPayloadBytes: 256 << 10,
+		Worker: config.MessagingWorkerConfig{
+			Consumer: "events-worker", FilterSubject: "events.>", DeadLetterSubject: "dead.events",
+			MaxConcurrency: 8,
+		},
+	}
+	got, err := messagingWorkerConfig(cfg)
+	if err != nil {
+		t.Fatalf("messagingWorkerConfig() error = %v", err)
+	}
+	if got.MaxDeliveryBytes != cfg.MaxPayloadBytes+natsjs.HeaderLimitBytes || got.HandlerTimeout != 30*time.Second || len(got.RetryDelays) != 4 {
+		t.Fatalf("worker defaults = %#v", got)
+	}
+}
+
+func TestMessagingCompositionRejectsInvalidWorkerBeforeConnection(t *testing.T) {
+	cfg := config.MessagingConfig{MaxPayloadBytes: 256 << 10}
+	if _, err := messagingWorkerConfig(cfg); !errors.Is(err, natsjs.ErrRejected) {
+		t.Fatalf("messagingWorkerConfig(invalid) error = %v, want ErrRejected", err)
+	}
+}
+
+// TestWorkerRunLoopPanicIsRecovered covers the loop this process exists to run.
+// It ran bare, so a panic in the fetch or ack bookkeeping took the process down
+// before the drain, the handler join, and the telemetry flush that records why.
+//
+// Both cases also pin the send-then-close order the drain depends on: it decides
+// cleanup safety from done and only then looks for a result that has not been
+// read, so a done that closed first would let a real exit reason go unreported.
+//
+//nolint:paralleltest // Installs a process-wide tracer provider for span capture.
+func TestWorkerRunLoopPanicIsRecovered(t *testing.T) {
+	const poison = "worker-panic-marker-8c23"
+	stopped := errors.New("worker stopped")
+
+	for _, testCase := range []struct {
+		name string
+		run  func(context.Context) error
+		want error
+	}{
+		{name: "panic", run: func(context.Context) error { panic(poison) }, want: errWorkerPanic},
+		{name: "return", run: func(context.Context) error { return stopped }, want: stopped},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var records strings.Builder
+			result := make(chan error, 1)
+			done := make(chan struct{})
+
+			go superviseWorkerRun(
+				t.Context(), slog.New(slog.NewJSONHandler(&records, nil)), testCase.run, result, done,
+			)
+
+			<-done
+			var got error
+			select {
+			case got = <-result:
+			default:
+				t.Fatal("superviseWorkerRun() closed done before reporting a result")
+			}
+			if !errors.Is(got, testCase.want) {
+				t.Fatalf("superviseWorkerRun() err = %v, want %v", got, testCase.want)
+			}
+			select {
+			case second := <-result:
+				t.Fatalf("superviseWorkerRun() reported a second result %v", second)
+			default:
+			}
+
+			// The panic's value reaches neither the reported error nor the record:
+			// only its type, its class, and the stack do. The shared panic-attribute
+			// constructor owns that argument.
+			logged := records.String()
+			if strings.Contains(got.Error(), poison) || strings.Contains(logged, poison) {
+				t.Fatalf("panic value leaked: err=%v records=%s", got, logged)
+			}
+			if errors.Is(testCase.want, errWorkerPanic) && !strings.Contains(logged, "worker_run_loop_panic") {
+				t.Fatalf("recovered panic was not recorded: %s", logged)
+			}
+		})
+	}
+}
+
+//nolint:paralleltest // Worker setup installs process-wide telemetry providers.
+func TestMessagingCompositionDoesNotBuildHandlerBeforeBrokerAdmission(t *testing.T) {
+	telemetrytest.RestoreGlobals(t)
+	telemetrytest.ClearAmbientExporterEnv(t)
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve unavailable worker endpoint: %v", err)
+	}
+	url := "nats://" + listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close unavailable worker endpoint: %v", err)
+	}
+	setWorkerTestEnvironment(t, url, "127.0.0.1:0")
+	built := false
+	err = run(t.Context(), nil, func(context.Context, config.Config, *slog.Logger) (*natsjs.Registry, func(context.Context), error) {
+		built = true
+		return testRegistry(t, "test", func(context.Context, string) error { return nil }), nil, nil
+	})
+	if err == nil {
+		t.Fatal("run(unavailable broker) error = nil")
+	}
+	if built {
+		t.Fatal("worker built the feature handler before broker topology admission")
+	}
+}
+
+func TestMessagingCompositionRejectsMissingDiagnosticsBeforeConnection(t *testing.T) {
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for worker connection sentinel: %v", err)
+	}
+	accepted := make(chan struct{}, 1)
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			_ = connection.Close()
+			accepted <- struct{}{}
+		}
+	}()
+	setWorkerTestEnvironment(t, "nats://"+listener.Addr().String(), "")
+	err = run(t.Context(), nil, func(context.Context, config.Config, *slog.Logger) (*natsjs.Registry, func(context.Context), error) {
+		return testRegistry(t, "test", func(context.Context, string) error { return nil }), nil, nil
+	})
+	if !errors.Is(err, config.ErrValidate) {
+		t.Fatalf("run(missing diagnostics) error = %v, want ErrValidate", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close worker connection sentinel: %v", err)
+	}
+	<-acceptDone
+	select {
+	case <-accepted:
+		t.Fatal("worker connected before rejecting missing diagnostics address")
+	default:
+	}
+}
+
+func setWorkerTestEnvironment(t *testing.T, messagingURL, diagnosticsAddr string) {
+	t.Helper()
+	configtest.IsolateEnv(t)
+	for key, value := range map[string]string{
+		// profile:authn-oidc-jwt:start
+		"APP__AUTHN__ISSUER":   "https://issuer.example.com",
+		"APP__AUTHN__AUDIENCE": "https://api.example.com",
+		// profile:authn-oidc-jwt:end
+		"APP__MESSAGING__URLS":                        messagingURL,
+		"APP__MESSAGING__ALLOW_PLAINTEXT":             "true",
+		"APP__MESSAGING__ALLOW_UNAUTHENTICATED":       "true",
+		"APP__MESSAGING__STREAM":                      "EVENTS",
+		"APP__MESSAGING__WORKER__CONSUMER":            "missing-diagnostics-worker",
+		"APP__MESSAGING__WORKER__FILTER_SUBJECT":      "events.test",
+		"APP__MESSAGING__WORKER__DEAD_LETTER_SUBJECT": "dead.events.test",
+		"APP__OBSERVABILITY__METRICS__ADDR":           diagnosticsAddr,
+	} {
+		t.Setenv(key, value)
+	}
+}

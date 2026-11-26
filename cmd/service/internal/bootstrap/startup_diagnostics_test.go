@@ -1,0 +1,193 @@
+package bootstrap
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/example/go-service-template-rest/internal/config"
+	"github.com/example/go-service-template-rest/internal/infra/telemetry"
+)
+
+func diagnosticsConfig(pprofEnabled bool) config.Config {
+	return config.Config{
+		HTTP: config.HTTPConfig{
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       5 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    16 << 10,
+		},
+		Observability: config.ObservabilityConfig{
+			Metrics: config.MetricsConfig{Addr: "127.0.0.1:0"},
+			Pprof:   config.PprofConfig{Enabled: pprofEnabled},
+		},
+	}
+}
+
+func TestDiagnosticsServerAlwaysServesMetrics(t *testing.T) {
+	t.Parallel()
+
+	srv := newDiagnosticsServer(diagnosticsConfig(false), telemetry.NewMetrics(), nil)
+
+	resp := serveDiagnostics(srv, "/metrics")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d, want %d", resp.Code, http.StatusOK)
+	}
+}
+
+// TestDiagnosticsServerServesBuildInfoWithoutPprof pins the one question no
+// other surface in the process could answer: which build is this pod running.
+//
+// The image build stamps the revision into an OCI label, unreachable from inside
+// the container, and builds with -buildvcs=false, so the binary carries no
+// vcs.revision either. The route is deliberately not gated behind pprof — the
+// moment an operator needs the build identity is exactly the moment profiling is
+// off, which is the shipped default.
+func TestDiagnosticsServerServesBuildInfoWithoutPprof(t *testing.T) {
+	t.Parallel()
+
+	cfg := diagnosticsConfig(false)
+	cfg.App = config.AppConfig{Env: "stage", Version: "v1.4.2", Commit: "0a1b2c3d"}
+	cfg.Observability.OTel.ServiceName = "orders"
+
+	resp := serveDiagnostics(newDiagnosticsServer(cfg, telemetry.NewMetrics(), nil), "/debug/buildinfo")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("/debug/buildinfo status = %d, want %d with pprof disabled", resp.Code, http.StatusOK)
+	}
+	if got := resp.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want JSON", got)
+	}
+
+	var got buildInfo
+	if err := json.Unmarshal(resp.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode build info: %v", err)
+	}
+	want := buildInfo{
+		Service:   "orders",
+		Version:   "v1.4.2",
+		Commit:    "0a1b2c3d",
+		Env:       "stage",
+		GoVersion: runtime.Version(),
+		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
+	}
+	if got != want {
+		t.Fatalf("build info = %+v, want %+v", got, want)
+	}
+}
+
+// TestDiagnosticsServerWithdrawsPprofWhenDisabled is the default posture: the
+// profile handlers disclose heap contents and process arguments, and the
+// diagnostics listener binds every interface so a scraper can reach it.
+func TestDiagnosticsServerWithdrawsPprofWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	srv := newDiagnosticsServer(diagnosticsConfig(false), telemetry.NewMetrics(), nil)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/cmdline"} {
+		resp := serveDiagnostics(srv, path)
+		if resp.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want %d when pprof is disabled", path, resp.Code, http.StatusNotFound)
+		}
+	}
+}
+
+func TestDiagnosticsServerServesPprofWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	srv := newDiagnosticsServer(diagnosticsConfig(true), telemetry.NewMetrics(), nil)
+
+	// heap is routed by pprof.Index rather than by its own pattern, so it proves
+	// the prefix mount and not just one explicit handler.
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/goroutine"} {
+		resp := serveDiagnostics(srv, path)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d when pprof is enabled", path, resp.Code, http.StatusOK)
+		}
+		if resp.Body.Len() == 0 {
+			t.Fatalf("%s returned an empty body", path)
+		}
+	}
+}
+
+// TestDiagnosticsServerWidensWriteTimeoutForProfiles keeps a 30s CPU profile from
+// being truncated by an API-shaped write deadline, which would break profiling at
+// exactly the moment it is wanted.
+func TestDiagnosticsServerWidensWriteTimeoutForProfiles(t *testing.T) {
+	t.Parallel()
+
+	cfg := diagnosticsConfig(true)
+	srv := newDiagnosticsServer(cfg, telemetry.NewMetrics(), nil)
+
+	if srv.WriteTimeout <= cfg.HTTP.WriteTimeout {
+		t.Fatalf("WriteTimeout = %s, want more than the API write timeout %s", srv.WriteTimeout, cfg.HTTP.WriteTimeout)
+	}
+	if srv.WriteTimeout < pprofWriteTimeout {
+		t.Fatalf("WriteTimeout = %s, want at least %s", srv.WriteTimeout, pprofWriteTimeout)
+	}
+}
+
+// TestDiagnosticsServerKeepsAPIWriteTimeoutWithoutPprof keeps the widening scoped
+// to the reason for it.
+func TestDiagnosticsServerKeepsAPIWriteTimeoutWithoutPprof(t *testing.T) {
+	t.Parallel()
+
+	cfg := diagnosticsConfig(false)
+	srv := newDiagnosticsServer(cfg, telemetry.NewMetrics(), nil)
+
+	if srv.WriteTimeout != cfg.HTTP.WriteTimeout {
+		t.Fatalf("WriteTimeout = %s, want the API write timeout %s", srv.WriteTimeout, cfg.HTTP.WriteTimeout)
+	}
+}
+
+// serveDiagnostics drives one diagnostics route. Every route the private
+// listener publishes for a human or a scraper is GET, so the method is not a
+// parameter.
+func serveDiagnostics(srv *http.Server, path string) *httptest.ResponseRecorder {
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil)
+	resp := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(resp, req)
+	return resp
+}
+
+// TestShutdownDiagnosticsForcesCloseOnBudgetExhaustion pins the bound on the
+// diagnostics stop. It runs after the API drain, so without a budget of its own a
+// scrape that never completes would park the process here and take the telemetry
+// flush with it — the same failure the dependency close is bounded against.
+func TestShutdownDiagnosticsForcesCloseOnBudgetExhaustion(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		var closed atomic.Bool
+		server := newFakeRuntimeServer()
+		server.onShutdown = func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		server.onClose = func() error {
+			closed.Store(true)
+			return nil
+		}
+
+		var logged bytes.Buffer
+		err := shutdownDiagnostics(context.Background(), slog.New(slog.NewJSONHandler(&logged, nil)), testShutdownBudget(), server)
+		if err != nil {
+			t.Fatalf("shutdownDiagnostics() error = %v, want the abandoned scrape reported as degraded, not failed", err)
+		}
+		if !closed.Load() {
+			t.Fatal("shutdownDiagnostics() did not force the listener closed after its budget expired")
+		}
+		if !strings.Contains(logged.String(), "diagnostics_forced") {
+			t.Fatalf("log = %q, want the forced close recorded", logged.String())
+		}
+	})
+}

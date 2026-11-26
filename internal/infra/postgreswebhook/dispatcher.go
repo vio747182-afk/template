@@ -1,0 +1,329 @@
+package postgreswebhook
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"hash"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivertype"
+	"github.com/riverqueue/rivercontrib/otelriver"
+)
+
+const (
+	MaxEventDataBytes = 128 << 10
+	MaxReceivers      = 1000
+	maxIdentityBytes  = 256
+	deliveryKind      = "outbound_webhook"
+	maxAttempts       = 20
+	ownerScopeField   = "owner_scope"
+	receiverIDField   = "receiver_id"
+)
+
+type Event struct {
+	OwnerScope string
+	ID         string
+	Type       string
+	OccurredAt time.Time
+	Data       json.RawMessage
+}
+
+type ReceiverID string
+
+type Dispatcher struct {
+	client    *river.Client[pgx.Tx]
+	endpoints *EndpointManifest
+}
+
+type Prepared struct {
+	client     *river.Client[pgx.Tx]
+	deliveries []deliveryArgs
+}
+
+type deliveryArgs struct {
+	AcceptanceID            string          `json:"acceptance_id" river:"unique"`
+	DeliveryID              string          `json:"delivery_id"`
+	OwnerScope              string          `json:"owner_scope"`
+	ReceiverID              string          `json:"receiver_id"`
+	ReceiverGeneration      int64           `json:"receiver_generation"`
+	URL                     string          `json:"url"`
+	ActiveKeyReference      string          `json:"active_key_reference"`
+	PredecessorKeyReference string          `json:"predecessor_key_reference,omitempty"`
+	FanoutFingerprint       string          `json:"fanout_fingerprint"`
+	Body                    json.RawMessage `json:"body"`
+}
+
+func (deliveryArgs) Kind() string { return deliveryKind }
+
+func NewDispatcher(endpoints *EndpointManifest) (*Dispatcher, error) {
+	if endpoints == nil || len(endpoints.entries) == 0 {
+		return nil, fmt.Errorf("%w: endpoint manifest is required", ErrConfig)
+	}
+	telemetry := otelriver.NewMiddleware(&otelriver.MiddlewareConfig{EnableTracePropagation: true})
+	client, err := river.NewClient(riverpgxv5.New(nil), &river.Config{Plugins: []rivertype.Plugin{telemetry}})
+	if err != nil {
+		return nil, fmt.Errorf("initialize River webhook dispatcher: %w", err)
+	}
+	return &Dispatcher{client: client, endpoints: endpoints}, nil
+}
+
+// Prepare fixes the complete receiver fan-out and endpoint snapshot before the
+// caller starts its transaction. Reuse the same Prepared value on transaction
+// retries so a changed manifest cannot alter the event's accepted fan-out.
+func (d *Dispatcher) Prepare(event Event, receivers []ReceiverID) (Prepared, error) {
+	if d == nil || d.client == nil || d.endpoints == nil {
+		return Prepared{}, fmt.Errorf("%w: dispatcher is required", ErrConfig)
+	}
+	if err := validateEvent(event); err != nil {
+		return Prepared{}, err
+	}
+	if len(receivers) == 0 || len(receivers) > MaxReceivers {
+		return Prepared{}, fmt.Errorf("%w: receivers must contain 1..%d entries", ErrConfig, MaxReceivers)
+	}
+
+	ordered := slices.Clone(receivers)
+	slices.Sort(ordered)
+	for i, receiver := range ordered {
+		if err := validateToken(receiverIDField, string(receiver)); err != nil {
+			return Prepared{}, err
+		}
+		if i > 0 && receiver == ordered[i-1] {
+			return Prepared{}, fmt.Errorf("%w: duplicate receiver", ErrConflict)
+		}
+	}
+
+	body, err := json.Marshal(struct {
+		Type      string          `json:"type"`
+		Timestamp string          `json:"timestamp"`
+		Data      json.RawMessage `json:"data"`
+	}{Type: event.Type, Timestamp: event.OccurredAt.UTC().Format(time.RFC3339Nano), Data: event.Data})
+	if err != nil {
+		return Prepared{}, fmt.Errorf("%w: encode event: %w", ErrConfig, err)
+	}
+
+	resolved := make([]endpoint, len(ordered))
+	for i, receiver := range ordered {
+		endpoint, err := d.endpoints.resolve(event.OwnerScope, string(receiver))
+		if err != nil {
+			return Prepared{}, err
+		}
+		resolved[i] = endpoint
+	}
+	fanoutFingerprint := fingerprintFanout(event.OwnerScope, event.ID, body, resolved)
+	// The first delivery deterministically anchors owner/event acceptance;
+	// FanoutFingerprint identifies the whole fan-out and DeliveryID identifies
+	// the receiver/generation delivery.
+	eventAnchor := deriveStableID("whe_", event.OwnerScope, event.ID)
+	prepared := Prepared{client: d.client, deliveries: make([]deliveryArgs, 0, len(ordered))}
+	for i, endpoint := range resolved {
+		deliveryID := deriveDeliveryID(event.OwnerScope, event.ID, endpoint.ReceiverID, endpoint.Generation)
+		acceptanceID := deliveryID
+		if i == 0 {
+			acceptanceID = eventAnchor
+		}
+		args := deliveryArgs{
+			AcceptanceID: acceptanceID, DeliveryID: deliveryID,
+			OwnerScope: event.OwnerScope, ReceiverID: endpoint.ReceiverID, ReceiverGeneration: endpoint.Generation,
+			URL: endpoint.URL, ActiveKeyReference: endpoint.ActiveKeyReference,
+			PredecessorKeyReference: endpoint.PredecessorKeyReference,
+			FanoutFingerprint:       fanoutFingerprint, Body: body,
+		}
+		if err := args.validate(); err != nil {
+			return Prepared{}, fmt.Errorf("prepare webhook delivery %s: %w", args.DeliveryID, err)
+		}
+		prepared.deliveries = append(prepared.deliveries, args)
+	}
+	return prepared, nil
+}
+
+func (p Prepared) DeliveryIDs() []string {
+	ids := make([]string, len(p.deliveries))
+	for i := range p.deliveries {
+		ids[i] = p.deliveries[i].DeliveryID
+	}
+	return ids
+}
+
+// Stage inserts the prepared fan-out in the caller-owned transaction, atomically
+// with the caller's other writes. The caller must roll back the transaction if
+// Stage returns an error, including ErrConflict. inserted reports whether this
+// call inserted the fan-out rather than finding it.
+func (p Prepared) Stage(ctx context.Context, tx pgx.Tx) (inserted bool, err error) {
+	if p.client == nil || tx == nil || len(p.deliveries) == 0 {
+		return false, fmt.Errorf("%w: prepared deliveries and transaction are required", ErrConfig)
+	}
+	newCount := 0
+	existingCount := 0
+	for _, delivery := range p.deliveries {
+		result, err := p.client.InsertTx(ctx, tx, delivery, deliveryInsertOpts())
+		if err != nil {
+			return false, fmt.Errorf("stage webhook delivery: %w", err)
+		}
+		if !result.UniqueSkippedAsDuplicate {
+			newCount++
+			continue
+		}
+		if result.Job == nil || !encodedMatchesFanout(result.Job.EncodedArgs, delivery) {
+			return false, ErrConflict
+		}
+		existingCount++
+	}
+	if newCount != 0 && existingCount != 0 {
+		return false, fmt.Errorf("%w: partial fanout replay", ErrConflict)
+	}
+	return newCount != 0, nil
+}
+
+// ResolveCurrent reconciles an immediate unknown commit against current River
+// rows. present is true when the complete prepared fan-out is present and
+// matches, false when none of its deliveries are currently present, and an
+// error for a read failure or partial/mismatched fan-out. River retention
+// bounds this readback: false does not prove the transaction never committed
+// after its jobs have been deleted. The caller's business transaction owns
+// replay after River retention.
+func (p Prepared) ResolveCurrent(ctx context.Context, pool *pgxpool.Pool) (present bool, err error) {
+	if pool == nil || len(p.deliveries) == 0 {
+		return false, fmt.Errorf("%w: prepared deliveries and pool are required", ErrConfig)
+	}
+	found := make(map[string]deliveryArgs, len(p.deliveries))
+	rows, err := pool.Query(ctx, `SELECT args FROM river_job WHERE kind = $1 AND args->>'delivery_id' = ANY($2)`, deliveryKind, p.DeliveryIDs())
+	if err != nil {
+		return false, fmt.Errorf("resolve webhook acceptance: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var encoded []byte
+		if err := rows.Scan(&encoded); err != nil {
+			return false, fmt.Errorf("resolve webhook acceptance: %w", err)
+		}
+		var args deliveryArgs
+		if err := json.Unmarshal(encoded, &args); err != nil {
+			return false, fmt.Errorf("%w: stored webhook arguments are invalid", ErrConflict)
+		}
+		found[args.DeliveryID] = args
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("resolve webhook acceptance: %w", err)
+	}
+	if len(found) == 0 {
+		return false, nil
+	}
+	if len(found) != len(p.deliveries) {
+		return false, fmt.Errorf("%w: fanout readback is not atomic", ErrConflict)
+	}
+	for _, delivery := range p.deliveries {
+		stored, ok := found[delivery.DeliveryID]
+		if !ok || !matchesFanout(stored, delivery) {
+			return false, ErrConflict
+		}
+	}
+	return true, nil
+}
+
+// deliveryInsertOpts deduplicates across every job state, including terminal
+// ones, so a replayed fan-out never re-sends a finished delivery while River
+// retains its row.
+func deliveryInsertOpts() *river.InsertOpts {
+	return &river.InsertOpts{
+		MaxAttempts: maxAttempts,
+		UniqueOpts:  river.UniqueOpts{ByArgs: true, ByState: rivertype.JobStates()},
+	}
+}
+
+func encodedMatchesFanout(encoded []byte, want deliveryArgs) bool {
+	var got deliveryArgs
+	return json.Unmarshal(encoded, &got) == nil && matchesFanout(got, want)
+}
+
+func matchesFanout(got, want deliveryArgs) bool {
+	return got.DeliveryID == want.DeliveryID &&
+		got.FanoutFingerprint == want.FanoutFingerprint
+}
+
+func (a deliveryArgs) validate() error {
+	for name, value := range map[string]string{
+		"acceptance_id": a.AcceptanceID, "delivery_id": a.DeliveryID,
+		ownerScopeField: a.OwnerScope, receiverIDField: a.ReceiverID,
+		"active_key_reference": a.ActiveKeyReference, "fanout_fingerprint": a.FanoutFingerprint,
+	} {
+		if err := validateToken(name, value); err != nil {
+			return err
+		}
+	}
+	if a.PredecessorKeyReference != "" {
+		if err := validateToken("predecessor_key_reference", a.PredecessorKeyReference); err != nil {
+			return err
+		}
+	}
+	if a.ReceiverGeneration <= 0 || len(a.Body) == 0 || !json.Valid(a.Body) {
+		return fmt.Errorf("%w: receiver generation and JSON body are required", ErrConfig)
+	}
+	_, err := parseWebhookURL(a.URL)
+	return err
+}
+
+func validateEvent(event Event) error {
+	for name, value := range map[string]string{ownerScopeField: event.OwnerScope, "event_id": event.ID, "event_type": event.Type} {
+		if err := validateToken(name, value); err != nil {
+			return err
+		}
+	}
+	if event.OccurredAt.IsZero() {
+		return fmt.Errorf("%w: occurred_at is required", ErrConfig)
+	}
+	if len(event.Data) == 0 || len(event.Data) > MaxEventDataBytes || !json.Valid(event.Data) {
+		return fmt.Errorf("%w: data must be valid JSON no larger than %d bytes", ErrConfig, MaxEventDataBytes)
+	}
+	return nil
+}
+
+func deriveDeliveryID(owner, eventID, receiver string, generation int64) string {
+	return deriveStableID("whd_", owner, eventID, receiver, strconv.FormatInt(generation, 10))
+}
+
+func deriveStableID(prefix string, values ...string) string {
+	h := sha256.New()
+	writeFields(h, values...)
+	return prefix + hex.EncodeToString(h.Sum(nil))
+}
+
+// writeFields writes each value followed by a NUL so adjacent fields cannot
+// shift into one another.
+func writeFields(h hash.Hash, values ...string) {
+	for _, value := range values {
+		_, _ = h.Write([]byte(value))
+		_, _ = h.Write([]byte{0})
+	}
+}
+
+func fingerprintFanout(owner, eventID string, body []byte, endpoints []endpoint) string {
+	h := sha256.New()
+	writeFields(h, owner, eventID, string(body))
+	for _, endpoint := range endpoints {
+		writeFields(h,
+			endpoint.ReceiverID, strconv.FormatInt(endpoint.Generation, 10), endpoint.URL,
+			endpoint.ActiveKeyReference, endpoint.PredecessorKeyReference,
+		)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func validateToken(name, value string) error {
+	if value == "" || len(value) > maxIdentityBytes || !utf8.ValidString(value) ||
+		strings.IndexFunc(value, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
+		return fmt.Errorf("%w: %s is invalid", ErrConfig, name)
+	}
+	return nil
+}

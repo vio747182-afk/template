@@ -1,0 +1,128 @@
+# Component Boundaries
+
+Load when package, dependency, source-of-truth, or composition ownership can
+change. Current code and package documentation remain the final factual
+authority.
+
+| Area | Owns | Does not own |
+| --- | --- | --- |
+| `cmd/entrypoint/` | The image's one executable: selects one role per process from its entry path and calls that role's `Main`. The only importer of `cmd/<role>` packages. | Configuration, flags, signals, logging, telemetry, or any role behavior. |
+| `cmd/<role>/role.go` | Thin role process entry (`Main`) that delegates to that role's bootstrap. | Business logic, request handling, dependency details, other roles. |
+| `cmd/service/internal/bootstrap/` | Composition, startup/shutdown, dependency admission, and runtime policy. | Use-case semantics, transport contracts, persistence logic. |
+| `internal/config/` | One validated immutable config snapshot. | Feature behavior, dependency wiring, request handling. |
+| `api/openapi/service.yaml` | REST contract source of truth. | Runtime logic. |
+| `internal/openapi/` | Generated OpenAPI bindings. | Hand-written business logic. |
+| `internal/<feature>/` | Use cases, business types, ports, invariants, and domain errors. | HTTP details, drivers, runtime config, process lifecycle. |
+| `internal/failure/` | Transport-neutral client-visible failure codes and mapper ordering. | Feature error identities, HTTP envelopes, gRPC statuses, or I/O. |
+| `internal/infra/http/` | HTTP server, middleware, mapping, route policy, and transport-edge observability. | Business rules or config loading. |
+| `internal/infra/httpclient/` | Always-available fixed HTTPS authority validation, post-DNS address admission, correlation stripping, mandatory transport ceilings, smaller operation policies, and pooled-client cleanup. | Provider auth, retry eligibility, provider parsing, telemetry, error mapping, readiness, or streaming policy. |
+| `internal/infra/postgres/` | PostgreSQL admission, commit-outcome policy, and repository code over `pgxpool`. | Pool lifecycle, migrations, HTTP behavior, config precedence. |
+| `internal/infra/postgresmigrate/` | Migration execution for `cmd/migrate`. | Runtime pool ownership or application startup. |
+| `internal/infra/telemetry/` | OpenTelemetry SDK setup and Prometheus export. | Feature semantics, startup logging, request routing. |
+| `internal/observability/otelconfig/` | Shared OTel vocabulary, defaults, and pure validation. | Config loading or SDK construction. |
+| `internal/observability/logctx/` | The process logger and context correlation fields. | Feature field choice, sinks, or request-ID meaning. |
+| `migrations/` | SQL schema source of truth. | Runtime repositories or generated Go. |
+
+<!-- profile:object-storage:start -->
+`internal/objectstorage/` owns the provider-neutral port;
+`internal/infra/s3/` owns one fixed-authority Amazon S3 or Cloudflare R2
+adapter, provider tuple, bounded admission, portable errors, and SDK mapping.
+AWS SDK for Go v2 owns signing, HTTP/XML, endpoints, retries, checksums,
+presigning, and multipart execution; deployment owns abandoned-upload lifecycle.
+<!-- profile:object-storage:end -->
+
+<!-- profile:grpc:start -->
+`api/proto/` owns protobuf contracts, `internal/gen/proto/` their generated
+messages and interfaces, `internal/infra/grpc/` native server policy/lifecycle,
+and `internal/infra/grpcclient/` bounded shared native connections. None owns feature semantics, storage,
+authentication, per-operation deadlines, retry eligibility, dependency
+criticality, or trust for a concrete neighbor.
+<!-- profile:grpc:end -->
+
+<!-- profile:authn-bearer:start -->
+`internal/infra/bearerauthn` owns inbound bearer grammar, sanitized failure
+taxonomy, verification telemetry, principal publication, and HTTP/gRPC
+adapters. Concrete engines implement its verifier contract.
+`internal/authntrust/` owns only the pure provider-URL, target-class, and
+token-profile predicates shared by config and those engines. It owns no
+configured value, credential verification, policy object, or authorization
+decision. `internal/infra/httpclient` enforces caller-supplied transport and
+operation ceilings without choosing their values or parsing bodies.
+<!-- profile:authn-bearer:end -->
+<!-- profile:authn-oidc-jwt:start -->
+`internal/infra/oidcjwt` owns JWT/JWKS discovery, verification, and refresh.
+<!-- profile:authn-oidc-jwt:end -->
+<!-- profile:authn-oidc-introspection:start -->
+`internal/infra/oauthintrospection` owns one RFC 7662 request, strict response
+admission, and idle-connection close. It caches, retries, and discovers
+nothing.
+<!-- profile:authn-oidc-introspection:end -->
+
+<!-- profile:outbox-postgres:start -->
+`internal/infra/postgresoutbox/` owns transactional append; `cmd/outbox-relay/`
+owns River-to-NATS composition, readiness, drain, and cleanup.
+<!-- profile:outbox-postgres:end -->
+
+<!-- profile:messaging-nats-jetstream:start -->
+`internal/domainevent/` owns typed event identity/version/time/encoding;
+`internal/messagingconfig/` owns pure NATS URL and stream/consumer-name rules;
+`internal/infra/natsjs/` owns composition routes and JetStream publication and
+settlement without exposing broker vocabulary to feature code.
+<!-- profile:messaging-nats-jetstream:end -->
+
+<!-- profile:jobs-postgres:start -->
+`cmd/jobs-worker/` and River own default-off typed PostgreSQL job execution;
+business job kinds, effect idempotency, operator exposure, and capacity remain
+feature/deployment decisions.
+<!-- profile:jobs-postgres:end -->
+
+`internal/webhooksecret/` owns only the shared Standard Webhooks secret format
+and raw signing-key length rule. Inbound and outbound adapters own their own
+manifest binding and error policies; the shared leaf exists only while at least
+one webhook profile is selected.
+
+<!-- profile:webhooks-durable:start -->
+`internal/outboundtrust/` and `internal/infra/postgreswebhook/` own the public
+address predicate and Standard Webhooks job adapter, not generic job state,
+subscriber administration, feature transactions, or deployment policy.
+<!-- profile:webhooks-durable:end -->
+
+<!-- profile:inbound-webhooks-standard:start -->
+`internal/inboundwebhook/manifest/` owns the pure non-secret endpoint document;
+the rest of `internal/inboundwebhook/` and
+`internal/infra/postgresinboundwebhook/` own Standard Webhooks verification,
+receipt identity, and River dispatch, not provider schemas, business effects,
+or deployment ingress.
+<!-- profile:inbound-webhooks-standard:end -->
+
+## Dependency Direction
+
+```text
+cmd/entrypoint
+  -> cmd/<role> (Main)
+     -> cmd/<role>/internal/bootstrap
+
+cmd/service/internal/bootstrap
+  -> internal/config
+  -> internal/<feature>/*
+  -> internal/infra/*
+
+internal/infra/http
+  -> internal/openapi
+  -> internal/<feature>/*
+
+internal/infra/postgres, internal/infra/telemetry
+  -> external libraries
+
+internal/config, internal/infra/telemetry
+  -> internal/observability/otelconfig
+```
+
+Only `cmd/entrypoint` imports role packages, and no role package imports
+another role or `cmd/entrypoint`; each role's composition stays in its own
+`internal/bootstrap`. Feature packages never depend on concrete transports. Integration packages stay
+under `internal/infra`; bootstrap may know them because it is the composition
+root. Shared contracts start beside their real consumer and move only for
+observed reuse. Rule and logging leaves do not import config, concrete adapters,
+transport libraries, or feature packages beyond the explicitly named inputs
+above.

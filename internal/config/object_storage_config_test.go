@@ -1,0 +1,53 @@
+package config
+
+import (
+	"errors"
+	"testing"
+)
+
+//nolint:paralleltest // This test mutates process-global environment.
+func TestObjectStorageConfigContract(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"missing provider", "APP__OBJECT_STORAGE__PROVIDER", ""},
+		{"missing bucket", "APP__OBJECT_STORAGE__BUCKET", ""},
+		{"invalid provider", "APP__OBJECT_STORAGE__PROVIDER", "other"},
+		{"missing credential source", "APP__OBJECT_STORAGE__CREDENTIAL_SOURCE", ""},
+		{"invalid credential source", "APP__OBJECT_STORAGE__CREDENTIAL_SOURCE", "other"},
+		{"zero object limit", "APP__OBJECT_STORAGE__MAX_OBJECT_BYTES", "0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetConfigEnv(t)
+			t.Setenv(test.key, test.value)
+			_, _, err := Load(t.Context(), LoadOptions{})
+			if !errors.Is(err, ErrValidate) {
+				t.Fatalf("Load() error = %v, want ErrValidate", err)
+			}
+		})
+	}
+
+	t.Run("normalizes Cloudflare R2", func(t *testing.T) {
+		resetConfigEnv(t)
+		t.Setenv("APP__OBJECT_STORAGE__PROVIDER", "  cloudflare_r2  ")
+		t.Setenv("APP__OBJECT_STORAGE__ENDPOINT", "  https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com  ")
+		t.Setenv("APP__OBJECT_STORAGE__REGION", "  ")
+		t.Setenv("APP__OBJECT_STORAGE__BUCKET", "  examplebucket  ")
+		t.Setenv("APP__OBJECT_STORAGE__EXPECTED_BUCKET_OWNER", "  ")
+		t.Setenv("APP__OBJECT_STORAGE__CREDENTIAL_SOURCE", "  static  ")
+
+		cfg, _, err := Load(t.Context(), LoadOptions{})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		want := ObjectStorageConfig{
+			Provider: "cloudflare_r2", Endpoint: "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
+			Region: "auto", Bucket: "examplebucket", CredentialSource: "static", MaxObjectBytes: 10 << 20,
+		}
+		if cfg.ObjectStorage != want {
+			t.Fatalf("ObjectStorage = %#v, want %#v", cfg.ObjectStorage, want)
+		}
+	})
+}

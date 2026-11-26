@@ -1,0 +1,455 @@
+package bootstrap
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
+	"testing"
+
+	"github.com/example/go-service-template-rest/internal/config"
+	"github.com/example/go-service-template-rest/internal/infra/telemetry"
+	"github.com/example/go-service-template-rest/internal/infra/telemetry/telemetrytest"
+	"go.opentelemetry.io/otel"
+)
+
+//nolint:paralleltest // Installs process-wide telemetry providers.
+func TestBootstrapTelemetryStageConfiguresExporter(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	telemetrytest.RestoreGlobals(t)
+
+	stage := bootstrapTelemetryStage(
+		context.Background(),
+		telemetryStageTestConfig("http://127.0.0.1:4318"),
+		telemetry.NewMetrics(),
+		slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+	)
+	if stage.tracingErr != nil {
+		t.Fatalf("bootstrapTelemetryStage() tracing error = %v", stage.tracingErr)
+	}
+	if stage.tracingEndpoint.Source != telemetry.SharedOTLPExporterConfigKey {
+		t.Fatalf("endpoint source = %q, want %q", stage.tracingEndpoint.Source, telemetry.SharedOTLPExporterConfigKey)
+	}
+	t.Cleanup(func() { stage.flush(context.Background()) })
+}
+
+// A platform that injects only the standard endpoint variable must still get
+// traces: ignoring it looks healthy and exports nothing.
+//
+//nolint:paralleltest // Mutates process-wide environment and telemetry providers.
+func TestBootstrapTelemetryStageUsesAmbientEndpointEnv(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	telemetrytest.RestoreGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318")
+
+	stage := bootstrapTelemetryStage(
+		context.Background(),
+		telemetryStageTestConfig(""),
+		telemetry.NewMetrics(),
+		slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+	)
+	if stage.tracingErr != nil {
+		t.Fatalf("bootstrapTelemetryStage() tracing error = %v", stage.tracingErr)
+	}
+	if stage.tracingEndpoint.Source != "OTEL_EXPORTER_OTLP_ENDPOINT" {
+		t.Fatalf("endpoint source = %q, want the ambient endpoint variable", stage.tracingEndpoint.Source)
+	}
+	t.Cleanup(func() { stage.flush(context.Background()) })
+}
+
+//nolint:paralleltest // Mutates process-wide environment and telemetry providers.
+func TestBootstrapTelemetryStageRejectsAmbientExporterEnv(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	telemetrytest.RestoreGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer secret-value")
+
+	stage := bootstrapTelemetryStage(
+		context.Background(),
+		telemetryStageTestConfig("http://127.0.0.1:4318"),
+		telemetry.NewMetrics(),
+		slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+	)
+	stage.flush(context.Background())
+	err := stage.tracingErr
+	if err == nil {
+		t.Fatal("bootstrapTelemetryStage() tracing error = nil, want ambient env rejection")
+	}
+	if !strings.Contains(err.Error(), "unsupported ambient otel exporter environment") {
+		t.Fatalf("bootstrapTelemetryStage() tracing error = %v, want ambient env context", err)
+	}
+	for _, leaked := range []string{"Bearer", "secret-value"} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("bootstrapTelemetryStage() tracing error = %v, leaked %q", err, leaked)
+		}
+	}
+}
+
+// An unconfigured exporter with ambient variables reports everything injected
+// because none of it was honored.
+//
+//nolint:paralleltest // Mutates process-wide exporter environment.
+func TestReportAdditionalAmbientOTLPEnvWarnsWhenExporterUnconfigured(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://injected-collector.example:4318")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer secret-value")
+
+	var buf bytes.Buffer
+	reportAdditionalAmbientOTLPEnv(
+		context.Background(),
+		slog.New(slog.NewJSONHandler(&buf, nil)),
+		telemetry.ExporterEndpoint{},
+		telemetry.ExporterEndpoint{},
+	)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "telemetry_ambient_env_present") {
+		t.Fatalf("log = %q, want ambient env warning", logged)
+	}
+	for _, want := range []string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_HEADERS",
+		"observability.otel.exporter.otlp_endpoint",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("log = %q, want to contain %q", logged, want)
+		}
+	}
+	for _, leaked := range []string{"Bearer", "secret-value", "injected-collector"} {
+		if strings.Contains(logged, leaked) {
+			t.Fatalf("log = %q, leaked %q", logged, leaked)
+		}
+	}
+}
+
+// An injected endpoint overridden by service config must be named with the
+// config key that won.
+//
+//nolint:paralleltest // Mutates process-wide exporter environment.
+func TestReportAdditionalAmbientOTLPEnvWarnsOnOverriddenEndpointWhenConfigured(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://injected-collector.example:4318")
+
+	var buf bytes.Buffer
+	reportAdditionalAmbientOTLPEnv(
+		context.Background(),
+		slog.New(slog.NewJSONHandler(&buf, nil)),
+		configuredTestTraceEndpoint(),
+		telemetry.ExporterEndpoint{},
+	)
+
+	logged := buf.String()
+	for _, want := range []string{
+		"telemetry_ambient_env_present",
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		startupDependencyModeConfigured,
+		"observability.otel.exporter.otlp_endpoint",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("log = %q, want %q", logged, want)
+		}
+	}
+}
+
+// The endpoint variable that supplied the destination was honored and must not
+// be reported as ignored.
+//
+//nolint:paralleltest // Mutates process-wide exporter environment.
+func TestReportAdditionalAmbientOTLPEnvSkipsTheHonoredEndpointVariable(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://injected-collector.example:4318")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "15000")
+
+	var buf bytes.Buffer
+	reportAdditionalAmbientOTLPEnv(
+		context.Background(),
+		slog.New(slog.NewJSONHandler(&buf, nil)),
+		telemetry.ExporterEndpoint{
+			URL:    "http://injected-collector.example:4318/v1/traces",
+			Source: "OTEL_EXPORTER_OTLP_ENDPOINT",
+		},
+		telemetry.ExporterEndpoint{},
+	)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "OTEL_EXPORTER_OTLP_TIMEOUT") {
+		t.Fatalf("log = %q, want the genuinely ignored variable", logged)
+	}
+	if strings.Contains(logged, "OTEL_EXPORTER_OTLP_ENDPOINT") {
+		t.Fatalf("log = %q, must not report the honored endpoint variable", logged)
+	}
+}
+
+// The metrics endpoint variable follows the same honored-versus-ignored rule.
+//
+//nolint:paralleltest // Mutates process-wide exporter environment.
+func TestReportAdditionalAmbientOTLPEnvSkipsTheHonoredMetricsEndpointVariable(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://injected-collector.example:4318/v1/metrics")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "15000")
+
+	var buf bytes.Buffer
+	reportAdditionalAmbientOTLPEnv(
+		context.Background(),
+		slog.New(slog.NewJSONHandler(&buf, nil)),
+		telemetry.ExporterEndpoint{},
+		telemetry.ExporterEndpoint{
+			URL:    "http://injected-collector.example:4318/v1/metrics",
+			Source: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+		},
+	)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "OTEL_EXPORTER_OTLP_TIMEOUT") {
+		t.Fatalf("log = %q, want the genuinely ignored variable", logged)
+	}
+	if strings.Contains(logged, "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") {
+		t.Fatalf("log = %q, must not report the honored metrics endpoint variable", logged)
+	}
+}
+
+// A rejected metrics credential is already reported as degraded setup, not as
+// an ignored variable.
+//
+//nolint:paralleltest // Mutates process-wide exporter environment and telemetry providers.
+func TestReportAdditionalAmbientOTLPEnvSilentOnMetricsConflictWhenConfigured(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	telemetrytest.RestoreGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_HEADERS", "authorization=Bearer secret-value")
+
+	for name, exporter := range map[string]config.OTelExporterConfig{
+		telemetry.MetricExporterConfigKey:     {OTLPMetricsEndpoint: "http://127.0.0.1:4318/v1/metrics"},
+		telemetry.SharedOTLPExporterConfigKey: {OTLPEndpoint: "http://127.0.0.1:4318"},
+	} {
+		cfg := telemetryStageTestConfig("")
+		cfg.Observability.OTel.Exporter = exporter
+		logged := bootstrapTelemetryStageLog(t, cfg)
+
+		if !strings.Contains(logged, "metrics_exporter_degraded") {
+			t.Fatalf("source %q log = %q, want the rejected metrics exporter reported as degraded", name, logged)
+		}
+		if strings.Contains(logged, "telemetry_ambient_env_present") {
+			t.Fatalf("source %q log = %q, want no warning for a variable that fails metrics exporter setup", name, logged)
+		}
+	}
+}
+
+// A rejected trace credential is already reported as degraded setup, not as an
+// ignored variable.
+//
+//nolint:paralleltest // Mutates process-wide exporter environment and telemetry providers.
+func TestReportAdditionalAmbientOTLPEnvSilentOnConflictWhenConfigured(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	telemetrytest.RestoreGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer secret-value")
+
+	logged := bootstrapTelemetryStageLog(t, telemetryStageTestConfig("http://127.0.0.1:4318"))
+
+	if strings.Contains(logged, "telemetry_ambient_env_present") {
+		t.Fatalf("log = %q, want no warning for a variable that fails exporter setup", logged)
+	}
+}
+
+// bootstrapTelemetryStageLog runs the telemetry stage and returns what it logged.
+// A rejected variable is only known to setup, so these cases run the stage
+// rather than hand-built endpoints.
+func bootstrapTelemetryStageLog(t *testing.T, cfg config.Config) string {
+	t.Helper()
+	var buf bytes.Buffer
+	stage := bootstrapTelemetryStage(
+		context.Background(),
+		cfg,
+		telemetry.NewMetrics(),
+		slog.New(slog.NewJSONHandler(&buf, nil)),
+	)
+	stage.flush(context.Background())
+	return buf.String()
+}
+
+//nolint:paralleltest // Clears process-wide exporter environment.
+func TestReportAdditionalAmbientOTLPEnvSilentWithoutAmbientEnv(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+
+	var buf bytes.Buffer
+	reportAdditionalAmbientOTLPEnv(
+		context.Background(),
+		slog.New(slog.NewJSONHandler(&buf, nil)),
+		telemetry.ExporterEndpoint{},
+		telemetry.ExporterEndpoint{},
+	)
+
+	if buf.Len() != 0 {
+		t.Fatalf("log = %q, want no warning without ambient env", buf.String())
+	}
+}
+
+func configuredTestTraceEndpoint() telemetry.ExporterEndpoint {
+	return telemetry.ExporterEndpoint{
+		URL:                 "http://127.0.0.1:4318/v1/traces",
+		Source:              telemetry.SharedOTLPExporterConfigKey,
+		ConfiguredByService: true,
+	}
+}
+
+// The startup summary is the one line an operator already reads. Trace-export
+// state belongs there so "this service exports no traces" does not depend on
+// correlating a separate warning a log filter may drop.
+func TestBootstrapReportStageRecordsTraceExporterState(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		endpoint telemetry.ExporterEndpoint
+		initErr  error
+		want     []string
+	}{
+		{
+			name:     "initialized from configuration",
+			endpoint: configuredTestTraceEndpoint(),
+			want: []string{
+				`"tracing.exporter":"initialized"`,
+				`"tracing.endpoint_source":"observability.otel.exporter.otlp_endpoint"`,
+			},
+		},
+		{
+			// An operator debugging where traces went needs to see that the
+			// destination came from the platform, not from this service.
+			name: "initialized from the ambient endpoint variable",
+			endpoint: telemetry.ExporterEndpoint{
+				URL:    "http://collector.example:4318/v1/traces",
+				Source: "OTEL_EXPORTER_OTLP_ENDPOINT",
+			},
+			want: []string{
+				`"tracing.exporter":"initialized"`,
+				`"tracing.endpoint_source":"OTEL_EXPORTER_OTLP_ENDPOINT"`,
+			},
+		},
+		{
+			name:     "disabled",
+			endpoint: telemetry.ExporterEndpoint{},
+			want:     []string{`"tracing.exporter":"disabled"`},
+		},
+		{
+			name:     "degraded",
+			endpoint: configuredTestTraceEndpoint(),
+			initErr:  errors.New("setup tracing: boom"),
+			want:     []string{`"tracing.exporter":"degraded"`},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+			bootstrapReportStage(
+				context.Background(),
+				slog.New(slog.NewJSONHandler(&buf, nil)),
+				telemetryStageTestConfig(tt.endpoint.URL),
+				config.LoadOptions{},
+				config.LoadReport{},
+				tt.endpoint,
+				tt.initErr,
+			)
+
+			for _, want := range tt.want {
+				if !strings.Contains(buf.String(), want) {
+					t.Fatalf("log = %q, want %s", buf.String(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestBootstrapReportStageLogsTelemetryFailureCause(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	bootstrapReportStage(
+		context.Background(),
+		slog.New(slog.NewJSONHandler(&buf, nil)),
+		telemetryStageTestConfig(""),
+		config.LoadOptions{},
+		config.LoadReport{},
+		telemetry.ExporterEndpoint{},
+		errors.New("unsupported ambient otel exporter environment (OTEL_EXPORTER_OTLP_ENDPOINT)"),
+	)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "startup_dependency_degraded") {
+		t.Fatalf("log = %q, want degraded warning", logged)
+	}
+	// A bare reason class is not actionable; the operator needs the cause.
+	if !strings.Contains(logged, "OTEL_EXPORTER_OTLP_ENDPOINT") {
+		t.Fatalf("log = %q, want the telemetry failure cause", logged)
+	}
+}
+
+// TestBootstrapTelemetryStageInstallsTracingWhenMetricsExportFails is the
+// regression anchor for a cascade that cost all three signals at once.
+//
+// The stage used to return on the first metrics failure, so SetupTracing never
+// ran and the tracer provider stayed the no-op one. The trigger is ordinary:
+// OTEL_EXPORTER_OTLP_ENDPOINT without a scheme, which the parser rejects
+// fail-closed. The service then started, reported healthy, and exported no metric
+// and no span — while every log record lost trace_id and span_id, because logctx
+// reads them off the span context a real provider produces.
+//
+//nolint:paralleltest // Installs process-wide telemetry providers.
+func TestBootstrapTelemetryStageInstallsTracingWhenMetricsExportFails(t *testing.T) {
+	telemetrytest.ClearAmbientExporterEnv(t)
+	telemetrytest.RestoreGlobals(t)
+
+	cfg := telemetryStageTestConfig("http://127.0.0.1:4318")
+	// Scheme-less, so metric endpoint resolution fails while tracing is fine.
+	cfg.Observability.OTel.Exporter.OTLPMetricsEndpoint = "collector:4318"
+	cfg.Observability.OTel.TracesSampler = "always_on"
+
+	metrics := telemetry.NewMetrics()
+	stage := bootstrapTelemetryStage(
+		context.Background(),
+		cfg,
+		metrics,
+		slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+	)
+	t.Cleanup(func() { stage.flush(context.Background()) })
+
+	if stage.tracingErr != nil {
+		t.Fatalf("tracing error = %v, want tracing to survive an unusable metrics endpoint", stage.tracingErr)
+	}
+	if stage.tracingEndpoint.Source != telemetry.SharedOTLPExporterConfigKey {
+		t.Fatalf("trace endpoint source = %q, want the configured shared OTLP endpoint", stage.tracingEndpoint.Source)
+	}
+
+	// A no-op provider hands back an invalid span context, which is exactly what
+	// drops correlation off every log record.
+	_, span := otel.GetTracerProvider().Tracer("telemetry-cascade-test").Start(context.Background(), "probe")
+	span.End()
+	if !span.SpanContext().IsValid() {
+		t.Fatal("tracer provider is the no-op one: log records would carry no trace_id or span_id")
+	}
+
+	// The meter provider survives too, so the gauge that reports degraded trace
+	// export can still be recorded — it was unreachable when metrics setup failed
+	// as a unit.
+	if err := metrics.RecordTraceExporterInitialization(context.Background(), true); err != nil {
+		t.Fatalf("RecordTraceExporterInitialization() error = %v, want a usable meter provider", err)
+	}
+}
+
+func telemetryStageTestConfig(otlpEndpoint string) config.Config {
+	return config.Config{
+		App: config.AppConfig{
+			Env:     "local",
+			Version: "test",
+		},
+		Observability: config.ObservabilityConfig{
+			OTel: config.OTelConfig{
+				ServiceName:      "test-service",
+				TracesSampler:    "always_off",
+				TracesSamplerArg: 0,
+				Exporter: config.OTelExporterConfig{
+					OTLPEndpoint: otlpEndpoint,
+				},
+			},
+		},
+	}
+}

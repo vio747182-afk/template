@@ -1,0 +1,254 @@
+package httpx
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/example/go-service-template-rest/internal/observability/logctx"
+)
+
+func TestAccessLogPreservesFirstFinalStatus(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	log := newTestServiceLogger(&out)
+	handler := AccessLog(log, true, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+
+	resp := doRequest(handler, http.MethodGet, "/status")
+
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNoContent)
+	}
+
+	var event map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &event); err != nil {
+		t.Fatalf("unmarshal access log: %v", err)
+	}
+	status, ok := event["status"].(float64)
+	if !ok {
+		t.Fatalf("logged status type = %T, want float64", event["status"])
+	}
+	if got := int(status); got != http.StatusNoContent {
+		t.Fatalf("logged status = %d, want %d", got, http.StatusNoContent)
+	}
+}
+
+func TestAccessLogOmitsRawRequestPath(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	handler := AccessLog(newTestServiceLogger(&out), true, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/users/secret-account", nil)
+	request.Pattern = "GET /users/{id}"
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+
+	var event map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &event); err != nil {
+		t.Fatalf("unmarshal access log: %v", err)
+	}
+	if _, ok := event["path"]; ok {
+		t.Fatalf("access log contains raw path: %v", event)
+	}
+	if got := event["route"]; got != "GET /users/{id}" {
+		t.Fatalf("logged route = %v, want the route template", got)
+	}
+}
+
+func TestAccessLogSkipsHealthProbesByDefault(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	log := newTestServiceLogger(&out)
+	handler := mustNewRouter(t, log, Handlers{}, nil, RouterConfig{})
+
+	for _, path := range []string{"/health/live", "/health/ready"} {
+		if resp := doRequest(handler, http.MethodGet, path); resp.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", path, resp.Code, http.StatusOK)
+		}
+	}
+
+	if out.Len() != 0 {
+		t.Fatalf("access log = %q, want health probes excluded", out.String())
+	}
+}
+
+func TestAccessLogRecordsHealthProbesWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	log := newTestServiceLogger(&out)
+	handler := mustNewRouter(t, log, Handlers{}, nil, RouterConfig{LogHealthProbes: true})
+
+	if resp := doRequest(handler, http.MethodGet, "/health/ready"); resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	if !strings.Contains(out.String(), "/health/ready") {
+		t.Fatalf("access log = %q, want the health probe recorded", out.String())
+	}
+}
+
+func TestAccessLogRecordsUnmatchedHealthLookalikePath(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	log := newTestServiceLogger(&out)
+	handler := mustNewRouter(t, log, Handlers{}, nil, RouterConfig{})
+
+	// The skip is route-based, so a path that only looks like a probe is still
+	// recorded. Otherwise scanning traffic could hide behind the exclusion.
+	if resp := doRequest(handler, http.MethodGet, "/health/live/../../admin"); resp.Code == 0 {
+		t.Fatal("request was not served")
+	}
+	if out.Len() == 0 {
+		t.Fatal("access log is empty, want the unmatched request recorded")
+	}
+	// A request that matched no route is labelled <unmatched>, not by the root
+	// mount's "/*" wildcard, so route-based dashboards separate real routes from
+	// unrouted traffic.
+	if !strings.Contains(out.String(), `"route":"<unmatched>"`) {
+		t.Fatalf("access log = %q, want the unmatched route label", out.String())
+	}
+}
+
+func TestAccessLogLabelsWrongMethodAsUnmatched(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	log := newTestServiceLogger(&out)
+	handler := mustNewRouter(t, log, Handlers{}, nil, RouterConfig{})
+
+	if resp := doRequest(handler, http.MethodDelete, "/health/live"); resp.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusMethodNotAllowed)
+	}
+	if !strings.Contains(out.String(), `"route":"<unmatched>"`) {
+		t.Fatalf("access log = %q, want the unmatched route label for a wrong-method request", out.String())
+	}
+}
+
+func TestAccessLogPreservesFlusherInterface(t *testing.T) {
+	t.Parallel()
+
+	var directFlusher bool
+	var flushErr error
+	handler := AccessLog(nil, true, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		directFlusher = true
+		flusher.Flush()
+		flushErr = http.NewResponseController(w).Flush()
+	}))
+
+	resp := doRequest(handler, http.MethodGet, "/flush")
+
+	if !directFlusher {
+		t.Fatal("wrapped ResponseWriter does not implement http.Flusher")
+	}
+	if flushErr != nil {
+		t.Fatalf("ResponseController.Flush() error = %v, want nil", flushErr)
+	}
+	if !resp.Flushed {
+		t.Fatal("ResponseRecorder.Flushed = false, want true")
+	}
+}
+
+func BenchmarkAccessLog(b *testing.B) {
+	for _, tc := range []struct {
+		name  string
+		level slog.Level
+	}{
+		{name: "enabled", level: slog.LevelInfo},
+		{name: "disabled", level: slog.LevelWarn},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			newHandler := func(output io.Writer) http.Handler {
+				// The benchmark needs JSON encoding and a configurable enabled level;
+				// slog.DiscardHandler provides neither signal.
+				log := logctx.NewProcessLogger(output, tc.level)
+				return AccessLog(log, true, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.WriteHeader(http.StatusNoContent)
+				}))
+			}
+			request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/health/live", nil)
+			request.Pattern = "GET /health/live"
+
+			var preflight bytes.Buffer
+			preflightResponse := httptest.NewRecorder()
+			newHandler(&preflight).ServeHTTP(preflightResponse, request)
+			if preflightResponse.Code != http.StatusNoContent {
+				b.Fatalf("preflight status = %d, want %d", preflightResponse.Code, http.StatusNoContent)
+			}
+			if logged := preflight.Len() > 0; logged != (tc.level <= slog.LevelInfo) {
+				b.Fatalf("preflight logged = %v at level %s", logged, tc.level)
+			}
+
+			handler := newHandler(io.Discard)
+			response := httptest.NewRecorder()
+
+			b.ReportAllocs()
+			for b.Loop() {
+				handler.ServeHTTP(response, request)
+			}
+		})
+	}
+}
+
+// TestAccessLogCarriesTheProblemCode separates the failures that share a status.
+// A 503 is load shedding, a saturated connection pool, or a draining instance,
+// and status alone cannot tell them apart — which is exactly the question during
+// an incident.
+func TestAccessLogCarriesTheProblemCode(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	log := newTestServiceLogger(&out)
+	handler := mustNewRouter(t, log, Handlers{}, nil, RouterConfig{MaxInFlight: 1})
+
+	// A route the contract does not declare, so the runtime answers its own
+	// problem rather than a handler's typed response.
+	resp := doRequest(handler, http.MethodGet, "/nope")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+
+	var event map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &event); err != nil {
+		t.Fatalf("unmarshal access log: %v", err)
+	}
+	if got, _ := event["problem_code"].(string); got != "not_found" {
+		t.Fatalf("logged problem_code = %q, want %q", got, "not_found")
+	}
+}
+
+// TestAccessLogOmitsProblemCodeForSuccess keeps the field out of the ordinary
+// line rather than logging an empty value that reads as a lost identifier.
+func TestAccessLogOmitsProblemCodeForSuccess(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	log := newTestServiceLogger(&out)
+	handler := mustNewRouter(t, log, Handlers{}, nil, RouterConfig{LogHealthProbes: true})
+
+	if resp := doRequest(handler, http.MethodGet, "/health/live"); resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	if out.Len() == 0 {
+		t.Fatal("access log is empty, so the assertion below would pass vacuously")
+	}
+	if strings.Contains(out.String(), "problem_code") {
+		t.Fatalf("access log = %q, want no problem_code on a successful request", out.String())
+	}
+}

@@ -1,0 +1,588 @@
+version: "2"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+run:
+  timeout: 3m
+
+linters:
+  default: none
+  enable:
+    - asasalint
+    - asciicheck
+    - govet
+    - staticcheck
+    - errcheck
+    - errname
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - containedctx
+    - copyloopvar
+    - depguard
+    - dogsled
+    - dupl
+    - dupword
+    - durationcheck
+    - embeddedstructfieldcheck
+    - errchkjson
+    - sqlclosecheck
+    - errorlint
+    - exhaustive
+    - exhaustruct_v5
+    - exptostd
+    - fatcontext
+    - forbidigo
+    - forcetypeassert
+    - gocheckcompilerdirectives
+    - gochecknoinits
+    - gochecksumtype
+    - goconst
+    - contextcheck
+    - cyclop
+    - gocritic
+    - gocognit
+    - iface
+    - ineffassign
+    - inamedparam
+    - interfacebloat
+    - intrange
+    - ireturn
+    - iotamixing
+    - loggercheck
+    - makezero
+    - mirror
+    - misspell
+    - modernize
+    - musttag
+    - nakedret
+    - nestif
+    - nilerr
+    - nilnesserr
+    - nilnil
+    - noctx
+    - nolintlint
+    - nosprintfhostport
+    - perfsprint
+    - predeclared
+    - promlinter
+    - protogetter
+    - reassign
+    - recvcheck
+    - revive
+    - rowserrcheck
+    - sloglint
+    - spancheck
+    - tagliatelle
+    - thelper
+    - tparallel
+    - gomoddirectives
+    - unconvert
+    - unqueryvet
+    - unparam
+    - unused
+    - usetesting
+    - usestdlibvars
+    - wastedassign
+    - wrapcheck
+  exclusions:
+    generated: strict
+    warn-unused: true
+    rules:
+      # Complexity gates are production-focused for now; table-heavy tests stay review-visible
+      # without forcing artificial helper extraction.
+      - path: _test\.go
+        linters:
+          - cyclop
+          - exhaustruct_v5
+          - gocognit
+          - nestif
+  settings:
+    embeddedstructfieldcheck:
+      forbid-mutex: true
+    exhaustive:
+      check:
+        - switch
+        - map
+    wrapcheck:
+      # A gRPC status is a transport answer, not an error to be annotated: the
+      # code and message are the whole payload, and wrapping one hides it from
+      # status.Code at the boundary that reads it. Without this, a policy
+      # interceptor returning status.Error has to declare a local error type
+      # that carries the status and nothing else — lint bookkeeping the reader
+      # then has to tell apart from internal/infra/grpc's ownedStatusError,
+      # which looks identical and is a real provenance marker.
+      ignore-sig-regexps:
+        - google\.golang\.org/grpc/status\.Error(f)?\(
+        # config.ParseLoadOptions already returns the operator-facing rejection:
+        # every error it produces is prefixed "parse flags:" and names the flag
+        # that was wrong. A composition root that wrapped it again would print
+        # that prefix twice, and has nothing to add — it has not reached a stage
+        # to name yet.
+        - internal/config\.ParseLoadOptions\(
+        # failure.Op is a wrapper — it is the repository's own alternative to
+        # fmt.Errorf, and the error it returns implements Unwrap. wrapcheck reads
+        # it as an unwrapped error from another package because the wrapping
+        # happens inside that package rather than at the call site. The path
+        # fragment is deliberately module-relative: scripts/init-module.sh
+        # rewrites the module path in a derived repository.
+        - internal/failure\.Op\(
+        # VerificationFailure already wraps the sanitized authentication cause.
+        - internal/infra/bearerauthn\.VerificationFailure\(
+        # InstrumentSet.Err reports the failure the set already wrapped with the
+        # metric name that could not be created. A call-site wrap would add a
+        # second, less specific prefix to the only registration error the
+        # constructor can produce. Same module-relative fragment rule as above.
+        - internal/infra/telemetry\.InstrumentSet\)\.Err\(
+        # InstallTelemetry already returns the operator-facing rejection, named
+        # for the binary that asked for it — "initialize worker metrics: ...".
+        # The composition root that receives it decides whether that is fatal;
+        # it has nothing to add to the wording, and wrapping would print the
+        # binary's own name twice. Same module-relative fragment rule as above.
+        - cmd/internal/runtimeopts\.InstallTelemetry\(
+        # ValidateGracePeriod, RequireDiagnosticsAddr, and ListenDiagnostics are
+        # the same case: each already returns the whole operator-facing
+        # rejection — the configuration key or code-owned budget to fit, or the
+        # component whose diagnostics address is missing or taken. The
+        # composition root that receives one has not reached a stage to name and
+        # would only print the binary's own name twice. Same module-relative
+        # fragment rule as above.
+        - cmd/internal/runtimeopts\.ValidateGracePeriod\(
+        - cmd/internal/runtimeopts\.RequireDiagnosticsAddr\(
+        - cmd/internal/runtimeopts\.ListenDiagnostics\(
+        - github.com/riverqueue/river\.JobSnooze\(
+    staticcheck:
+      checks:
+        - all
+        - "-ST1000"
+    sloglint:
+      # Correlation is published by internal/observability/logctx from the context
+      # a record is logged with, so a call that drops the context it already holds
+      # silently drops request_id, trace_id, and span_id. "scope" enforces the
+      # context-accepting method exactly where a context exists, rather than
+      # forcing context.Background() into records that genuinely have none.
+      context: scope
+    iface:
+      enable:
+        - identical
+        - unused
+        - opaque
+        - unexported
+    goconst:
+      ignore-tests: true
+      min-occurrences: 4
+    govet:
+      enable-all: true
+      disable:
+        # Reordering fields for padding is a measured performance decision, not
+        # a default readability rule.
+        - fieldalignment
+        # findcall needs a repository-owned target; enabled without one it does
+        # not express a stable policy.
+        - findcall
+        # The analyzer is intentionally outside the default vet suite because it
+        # reports too many benign shadows to serve as a repository gate.
+        - shadow
+    ireturn:
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+        - generic
+        - '^.*/internal/openapi\..*ResponseObject$'
+        - '^go\.opentelemetry\.io/otel/metric\.MeterProvider$'
+        - '^.*/internal/inboundwebhook\.Receiver$'
+        - '^go\.opentelemetry\.io/otel/sdk/metric\.Reader$'
+        - '^go\.opentelemetry\.io/otel/sdk/trace\.Sampler$'
+    depguard:
+      rules:
+        generated_external_proto_stays_in_adapters:
+          list-mode: lax
+          files:
+            - "**/*.go"
+            - "!**/internal/infra/**/*.go"
+            - "!**/internal/gen/proto/**/*.go"
+          deny:
+            - pkg: __MODULE__/internal/gen/proto/external
+              desc: generated external gRPC types stay inside the named adapter.
+        feature_packages_no_adapters:
+          list-mode: lax
+          files:
+            - "**/internal/**/*.go"
+            - "!**/cmd/**/*.go"
+            - "!**/internal/config/*.go"
+            - "!**/internal/config/**/*.go"
+            - "!**/internal/infra/**/*.go"
+            - "!**/internal/observability/**/*.go"
+            - "!**/internal/openapi/**/*.go"
+          deny:
+            - pkg: __MODULE__/internal/openapi
+              desc: feature packages must stay transport-contract agnostic; map generated OpenAPI types in internal/infra/http.
+            - pkg: __MODULE__/internal/infra
+              desc: feature packages must not import concrete infra adapters; wire adapters in bootstrap.
+            - pkg: __MODULE__/internal/config
+              desc: runtime configuration belongs to bootstrap and adapters, not feature behavior.
+            - pkg: __MODULE__/cmd
+              desc: feature packages must not import composition roots.
+            - pkg: github.com/jackc/pgx/v5
+              desc: direct Postgres driver usage belongs in internal/infra/postgres.
+        config_no_runtime_owners:
+          list-mode: lax
+          files:
+            - "**/internal/config/*.go"
+            - "**/internal/config/**/*.go"
+            - "!**/internal/config/*_test.go"
+          allow:
+            # The authn trust rules are a leaf for the same reason otelconfig is:
+            # this package must refuse a bad value at load, and the verifier must
+            # enforce the same rule at startup and at runtime. Allowing the leaf
+            # is what keeps one rule from being written twice.
+            - __MODULE__/internal/authntrust
+            - __MODULE__/internal/messagingconfig
+            - __MODULE__/internal/inboundwebhook/manifest
+            - __MODULE__/internal/observability/otelconfig
+            - __MODULE__/internal/outboundtrust
+          deny:
+            - pkg: __MODULE__/internal
+              desc: config parsing must not depend on features, runtime adapters, or transport contracts.
+            - pkg: __MODULE__/cmd
+              desc: config parsing must not depend on composition roots.
+        health_no_runtime_adapters:
+          list-mode: lax
+          files:
+            - "**/internal/health/*.go"
+            - "**/internal/health/**/*.go"
+            - "!**/internal/health/*_test.go"
+          deny:
+            - pkg: __MODULE__/internal
+              desc: health behavior receives probes and must not depend on config, adapters, generated contracts, or other features.
+            - pkg: __MODULE__/cmd
+              desc: health behavior must not depend on composition roots.
+        failure_is_transport_neutral:
+          list-mode: lax
+          files:
+            - "**/internal/failure/*.go"
+            - "**/internal/failure/**/*.go"
+            - "!**/internal/failure/*_test.go"
+          deny:
+            - pkg: net/http
+              desc: failure identities are transport-neutral; HTTP rendering belongs in internal/problem and internal/infra/http.
+            - pkg: google.golang.org/grpc
+              desc: failure identities are transport-neutral; gRPC status rendering belongs in internal/infra/grpc.
+            - pkg: __MODULE__/internal
+              desc: failure is a leaf shared by features and transports and must not depend on repository runtime owners.
+            - pkg: __MODULE__/cmd
+              desc: failure must not depend on composition roots.
+        problem_is_a_catalog_leaf:
+          list-mode: lax
+          # Both globs are required: "**" matches at least one path segment here,
+          # so "**/internal/problem/**/*.go" alone covers subdirectories and
+          # silently skips the package's own files.
+          files:
+            - "**/internal/problem/*.go"
+            - "**/internal/problem/**/*.go"
+          deny:
+            - pkg: google.golang.org/grpc
+              desc: the Problem catalog is the HTTP rendering of a failure; gRPC status rendering belongs in internal/infra/grpc.
+            - pkg: __MODULE__/internal/infra
+              desc: problem is a leaf shared by the HTTP adapter and by feature packages that may not import an adapter; it must not depend on one itself.
+            - pkg: __MODULE__/cmd
+              desc: problem must not depend on composition roots.
+        http_no_postgres:
+          list-mode: lax
+          files:
+            - "**/internal/infra/http/*.go"
+            - "**/internal/infra/http/**/*.go"
+            - "!**/internal/infra/http/*_test.go"
+          deny:
+            - pkg: __MODULE__/internal/infra/postgres
+              desc: HTTP maps feature behavior and must not call the database adapter directly.
+        otelconfig_is_pure_policy:
+          list-mode: lax
+          files:
+            - "**/internal/observability/otelconfig/*.go"
+            - "**/internal/observability/otelconfig/**/*.go"
+            - "!**/internal/observability/otelconfig/*_test.go"
+          deny:
+            - pkg: __MODULE__/internal
+              desc: otelconfig is pure OpenTelemetry policy and must not depend on repository runtime packages.
+            - pkg: go.opentelemetry.io/otel/sdk
+              desc: SDK construction belongs in internal/infra/telemetry.
+        # This leaf is the same kind of package as otelconfig above and was held
+        # to the rule only by convention. Composition roots and both inbound
+        # transports import it, so a runtime dependency added here for convenience
+        # would be a cycle waiting for the next importer rather than a local shortcut.
+        logctx_is_pure_policy:
+          list-mode: lax
+          files:
+            - "**/internal/observability/logctx/*.go"
+            - "**/internal/observability/logctx/**/*.go"
+            - "!**/internal/observability/logctx/*_test.go"
+          allow:
+            # The request, trace, and span ids this handler attaches are read
+            # through the same context leaf every transport writes them with, so
+            # it is the one repository package the logger may reach.
+            - __MODULE__/internal/reqctx
+          deny:
+            - pkg: __MODULE__/internal
+              desc: logctx is the shared process logger and must not depend on repository runtime packages.
+            - pkg: __MODULE__/cmd
+              desc: logctx must not depend on composition roots.
+        authntrust_is_pure_policy:
+          list-mode: lax
+          files:
+            - "**/internal/authntrust/*.go"
+            - "**/internal/authntrust/**/*.go"
+            - "!**/internal/authntrust/*_test.go"
+          allow:
+            # The fixed HTTPS target shape is one rule shared with config and the
+            # outbound HTTP client; outboundtrust is itself a stdlib-only leaf.
+            - __MODULE__/internal/outboundtrust
+          deny:
+            - pkg: __MODULE__/internal
+              desc: authntrust is a pure trust-rule leaf shared by internal/config and the verifier; a dependency here would put it back out of reach of one of them.
+            - pkg: __MODULE__/cmd
+              desc: authntrust must not depend on composition roots.
+        messagingconfig_is_pure_policy:
+          list-mode: lax
+          files:
+            - "**/internal/messagingconfig/*.go"
+            - "!**/internal/messagingconfig/*_test.go"
+          deny:
+            - pkg: __MODULE__/internal
+              desc: messagingconfig is the pure rule leaf shared by config and the NATS adapter.
+            - pkg: __MODULE__/cmd
+              desc: messagingconfig must not depend on composition roots.
+        inbound_webhook_manifest_is_pure_policy:
+          list-mode: lax
+          files:
+            - "**/internal/inboundwebhook/manifest/*.go"
+            - "!**/internal/inboundwebhook/manifest/*_test.go"
+          deny:
+            - pkg: __MODULE__/internal
+              desc: inbound webhook manifest rules must stay usable by config and the runtime adapter.
+            - pkg: __MODULE__/cmd
+              desc: inbound webhook manifest rules must not depend on composition roots.
+        oidcjwt_core_is_transport_neutral:
+          list-mode: lax
+          files:
+            - "**/internal/infra/oidcjwt/*.go"
+            - "!**/internal/infra/oidcjwt/*_test.go"
+          deny:
+            - pkg: github.com/getkin/kin-openapi
+              desc: inbound HTTP security belongs in bearerauthn, not the JWT engine.
+            - pkg: github.com/go-chi/chi/v5
+              desc: the JWT engine never routes; chi belongs in internal/infra/http.
+            - pkg: google.golang.org/grpc
+              desc: inbound gRPC policy belongs in bearerauthn, not the JWT engine.
+        oauthintrospection_core_is_transport_neutral:
+          list-mode: lax
+          files:
+            - "**/internal/infra/oauthintrospection/*.go"
+            - "!**/internal/infra/oauthintrospection/*_test.go"
+          deny:
+            - pkg: github.com/getkin/kin-openapi
+              desc: inbound HTTP security belongs in bearerauthn, not the introspection engine.
+            - pkg: github.com/go-chi/chi/v5
+              desc: the introspection engine never routes; chi belongs in internal/infra/http.
+            - pkg: google.golang.org/grpc
+              desc: inbound gRPC policy belongs in bearerauthn, not the introspection engine.
+            - pkg: __MODULE__/internal/config
+              desc: the introspection engine must not import configuration.
+            - pkg: __MODULE__/internal/infra/oidcjwt
+              desc: concrete trust engines must not import each other.
+        bearerauthn_core_is_transport_neutral:
+          list-mode: lax
+          files:
+            - "**/internal/infra/bearerauthn/*.go"
+            - "!**/internal/infra/bearerauthn/http.go"
+            - "!**/internal/infra/bearerauthn/grpc.go"
+            - "!**/internal/infra/bearerauthn/*_test.go"
+          deny:
+            - pkg: github.com/getkin/kin-openapi
+              desc: the OpenAPI security-requirement seam belongs in bearerauthn's http.go adapter.
+            - pkg: github.com/go-chi/chi/v5
+              desc: the shared runtime answers a resolver seam and never routes; chi belongs in internal/infra/http.
+            - pkg: google.golang.org/grpc
+              desc: gRPC interceptors, metadata, and status belong in bearerauthn's grpc.go adapter.
+            - pkg: __MODULE__/internal/infra/oidcjwt
+              desc: the shared runtime must not import a concrete trust engine.
+            - pkg: __MODULE__/internal/infra/oauthintrospection
+              desc: the shared runtime must not import a concrete trust engine.
+            - pkg: __MODULE__/internal/config
+              desc: the shared runtime must not import configuration.
+        postgres_driver_boundary:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/infra/postgres/*.go"
+            # The outbox store binds River insertion to its caller-owned pgx.Tx.
+            - "!**/internal/infra/postgresoutbox/store*.go"
+            - "!**/internal/infra/postgresidempotency/store*.go"
+            # pgtest is a PostgreSQL adapter like the two above, scoped to tests:
+            # it creates and drops the per-test database, which is driver work.
+            - "!**/internal/infra/postgres/pgtest/*.go"
+            - "!**/internal/infra/postgresmigrate/*.go"
+            # The service composition root retains the concrete library pool;
+            # feature and transport packages still cannot import the driver.
+            - "!**/cmd/service/internal/bootstrap/startup_dependencies.go"
+            - "!**/cmd/service/internal/bootstrap/startup_idempotency.go"
+            # Webhook staging uses River InsertTx on the caller-owned pgx
+            # transaction; delivery itself owns no independent SQL schema.
+            - "!**/internal/infra/postgreswebhook/*.go"
+            - "!**/internal/infra/postgresinboundwebhook/*.go"
+            - "!**/cmd/jobs-worker/internal/bootstrap/run.go"
+            - "!**/cmd/jobs-worker/builder_webhooks.go"
+            - "!**/cmd/jobs-worker/inbound_webhook_bindings.go"
+            - "!**/cmd/service/internal/bootstrap/startup_inbound_webhooks.go"
+          deny:
+            - pkg: database/sql
+              desc: database driver access belongs in PostgreSQL runtime or migration adapters.
+            - pkg: github.com/jackc/pgx/v5
+              desc: direct pgx usage belongs in PostgreSQL runtime or migration adapters.
+            - pkg: github.com/lib/pq
+              desc: use the approved pgx-based Postgres adapter in internal/infra/postgres.
+            - pkg: gorm.io/gorm
+              desc: persistence ORM usage is not part of the approved repository data-access model.
+        sqlc_boundary:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/infra/postgres/*.go"
+            - "!**/internal/infra/postgresidempotency/store*.go"
+            - "!**/internal/infra/postgresinboundwebhook/*.go"
+          deny:
+            - pkg: __MODULE__/internal/infra/postgres/sqlcgen
+              desc: generated sqlc types stay behind the hand-written internal/infra/postgres adapter.
+        outboundtrust_is_pure_policy:
+          list-mode: lax
+          files:
+            - "**/internal/outboundtrust/*.go"
+            - "!**/internal/outboundtrust/*_test.go"
+          deny:
+            - pkg: __MODULE__/internal
+              desc: outboundtrust is a standard-library-only policy leaf shared by fixed and dynamic outbound HTTP transports.
+            - pkg: __MODULE__/cmd
+              desc: outboundtrust must not depend on composition roots.
+        approved_router_boundary:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/openapi/*.go"
+            - "!**/internal/infra/http/*.go"
+          deny:
+            - pkg: github.com/go-chi/chi/v5
+              desc: chi router usage belongs in internal/infra/http and generated OpenAPI bindings only.
+        alternate_router_policy:
+          list-mode: lax
+          files:
+            - "$all"
+          deny:
+            - pkg: github.com/gin-gonic/gin
+              desc: use the approved chi and OpenAPI HTTP stack in internal/infra/http.
+            - pkg: github.com/gofiber/fiber
+              desc: use the approved net/http-compatible chi and OpenAPI HTTP stack.
+            - pkg: github.com/gorilla/mux
+              desc: use the approved chi and OpenAPI HTTP stack in internal/infra/http.
+            - pkg: github.com/julienschmidt/httprouter
+              desc: use the approved chi and OpenAPI HTTP stack in internal/infra/http.
+            - pkg: github.com/labstack/echo
+              desc: use the approved chi and OpenAPI HTTP stack in internal/infra/http.
+        alternate_logging_policy:
+          list-mode: lax
+          files:
+            - "$all"
+          deny:
+            - pkg: github.com/rs/zerolog
+              desc: use the standard log/slog logging surface configured by bootstrap.
+            - pkg: github.com/sirupsen/logrus
+              desc: use the standard log/slog logging surface configured by bootstrap.
+            - pkg: go.uber.org/zap
+              desc: use the standard log/slog logging surface configured by bootstrap.
+    cyclop:
+      max-complexity: 20
+    exhaustruct_v5:
+      allow-empty-returns: true
+      explicit-mode: true
+      enforce-patterns:
+        - '^__MODULE_REGEX__/internal/openapi\.Problem$'
+        - '^__MODULE_REGEX__/internal/config\.(Config|AppConfig|HTTPConfig|LogConfig|ObservabilityConfig|OTelConfig|OTelExporterConfig|PostgresConfig)$'
+        - '^__MODULE_REGEX__/internal/config\.(GRPCConfig|GRPCServerConfig|GRPCTLSConfig)$'
+        # A configured trust value added to PolicyInput must reach the composition
+        # root, or a deployment runs with it unset; oidcjwt.PolicyInput says why
+        # this entry is what enforces that.
+        - '^__MODULE_REGEX__/internal/infra/oidcjwt\.PolicyInput$'
+        - '^__MODULE_REGEX__/internal/infra/oauthintrospection\.PolicyInput$'
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^(fmt\.Print(f|ln)?|print|println)$'
+          msg: use structured logging or test assertions instead of process stdout debug output.
+        - pattern: '^log\.(Fatal(f|ln)?|Panic(f|ln)?|Print(f|ln)?)$'
+          msg: use log/slog through the configured logging surface, or return an error to the caller.
+    gocognit:
+      min-complexity: 30
+    nestif:
+      min-complexity: 5
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    gocritic:
+      # The default check set is already clean here, so the value is entirely in
+      # the tags golangci-lint leaves off. Each check below is disabled against a
+      # measured result on this tree, not a preference.
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - opinionated
+        - experimental
+      disabled-checks:
+        # Both want a pointer wherever a struct is copied. The repository passes
+        # config and option structs by value on purpose so a callee cannot mutate
+        # a caller's value, and no benchmark has claimed either copy as a cost.
+        - hugeParam
+        - rangeValCopy
+        # Signature shape the call site settles: a result is named when a defer
+        # writes it, and parameter types stay split where the names read better
+        # apart. Neither has one answer this repository can pin.
+        - unnamedResult
+        - paramTypeCombine
+        # nolintlint already requires an explanation on every directive.
+        - whyNoLint
+        # revive's import-shadowing owns this rule below; one policy, one owner.
+        - importShadow
+        # Misreads an out-parameter: telemetry.InstrumentSet's Int64Counter and
+        # siblings take *metric.Int64Counter precisely to write through it.
+        - ptrToRefParam
+    revive:
+      enable-default-rules: true
+      rules:
+        # Exported/package boilerplate conflicts with the repository comment
+        # policy: comments must carry information the declaration cannot.
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+        # A classified error is the value in the repository's (error, bool)
+        # value/ok pairs; moving it last would make those predicates less clear.
+        - name: error-return
+          disabled: true
+        - name: context-as-argument
+        - name: unused-parameter
+        # A local named after an imported package makes the package unreachable
+        # for the rest of that scope, so the next call added there fails to
+        # compile for a reason the name does not show.
+        - name: import-shadowing
+        - name: redundant-import-alias
+        - name: unnecessary-format
+        - name: use-slices-sort
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+          koanf: snake
+          yaml: snake

@@ -1,0 +1,115 @@
+package telemetry
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+)
+
+func setupTracingForEnvPolicyTest(t *testing.T, exporter TraceExporterConfig) error {
+	t.Helper()
+
+	_, shutdown, err := SetupTracing(context.Background(), envPolicyTracingConfig(exporter))
+	if err == nil {
+		if shutdownErr := shutdown(context.Background()); shutdownErr != nil {
+			t.Fatalf("shutdown tracing after unexpected setup success: %v", shutdownErr)
+		}
+	}
+	return err
+}
+
+func envPolicyTracingConfig(exporter TraceExporterConfig) TracingConfig {
+	return TracingConfig{
+		Resource: ResourceConfig{
+			ServiceName:    "test-service",
+			ServiceVersion: "test",
+			DeploymentEnv:  "local",
+		},
+		TracesSampler:    "always_off",
+		TracesSamplerArg: 0,
+		Exporter:         exporter,
+	}
+}
+
+func requireAmbientExporterEnvError(t *testing.T, err error, want string) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatal("SetupTracing() error = nil, want ambient exporter environment rejection")
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("SetupTracing() error = %v, want %q", err, want)
+	}
+}
+
+func requireErrorDoesNotContain(t *testing.T, err error, forbidden string) {
+	t.Helper()
+
+	if forbidden == "" {
+		return
+	}
+	if strings.Contains(err.Error(), forbidden) {
+		t.Fatalf("error %q leaked %q", err, forbidden)
+	}
+}
+
+func exportOneTestSpan(t *testing.T, endpoint ExporterEndpoint, cfg TraceExporterConfig) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	exporter, err := newOTLPTraceExporter(ctx, endpoint, cfg)
+	if err != nil {
+		t.Fatalf("create OTLP trace exporter: %v", err)
+	}
+
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSyncer(exporter),
+	)
+	_, span := provider.Tracer("telemetry-test").Start(ctx, "test-span")
+	span.End()
+
+	if err := provider.ForceFlush(ctx); err != nil {
+		_ = provider.Shutdown(ctx)
+		t.Fatalf("force flush trace provider: %v", err)
+	}
+	if err := provider.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown trace provider: %v", err)
+	}
+}
+
+func assertCollectorPath(t *testing.T, paths <-chan string, want string) {
+	t.Helper()
+
+	select {
+	case got := <-paths:
+		if got != want {
+			t.Fatalf("collector path = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("collector path was not requested")
+	}
+}
+
+func assertNoCollectorRequest(t *testing.T, paths <-chan string, name string) {
+	t.Helper()
+
+	select {
+	case got := <-paths:
+		t.Fatalf("%s received unexpected request path %q", name, got)
+	default:
+	}
+}
+
+func resourceAttributes(span sdktrace.ReadOnlySpan) map[string]string {
+	attrs := make(map[string]string)
+	for _, attr := range span.Resource().Attributes() {
+		attrs[string(attr.Key)] = attr.Value.AsString()
+	}
+	return attrs
+}

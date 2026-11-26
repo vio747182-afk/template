@@ -1,0 +1,381 @@
+# Build, Test, and Development Commands
+
+Ordinary local Go commands come from [Go Validation](validation/go.md) under
+[AGENTS.md](../AGENTS.md#validation-budget). [Validation Routing](validation-routing.md)
+selects mixed or specialized commands. Load the
+[Evidence Contract](spec-first-workflow/shared/evidence-contract.md) for claim
+scope, reuse, additional required proof, or unavailable infrastructure. This
+catalog describes available tools, not a checklist.
+Ordinary local Go development ends at a matching build and relevant unit tests;
+expanded checks require an explicit task requirement or their existing CI/release
+gate. The Makefile owns non-trivial composition; ordinary tooling stays direct.
+
+`Makefile` includes template-owned `make/template.mk`. A derived repository may
+add uniquely named service commands in `make/service.mk`; standard targets are
+not override points.
+
+## Tools
+
+Repository Go tools are pinned by `tools/go.mod` and run without a wrapper:
+
+```bash
+go tool -modfile=tools/go.mod <tool> [args...]
+```
+
+GolangCI is the exception: use the Make lint targets or
+`scripts/ci/golangci-lint.sh` so the portable `__MODULE__` policy placeholder is
+resolved to the current root module before the pinned binary reads the config.
+
+Buf and its Protobuf plugins are pinned in the same tools module. Redocly is
+pinned by the Makefile and invoked through `npx` with telemetry disabled.
+
+## Initialize a service
+
+```bash
+make template-init \
+  MODULE=github.com/acme/service \
+  CODEOWNER=@acme/platform
+make build
+ALLOW_FULL=1 make test-all
+```
+
+The default is the documented minimal service. Supported selections are the
+individual choices and dependency combinations documented in the README:
+
+- `DATABASE=postgres`;
+- `DATABASE=postgres HTTP_IDEMPOTENCY=postgres`;
+- `DATABASE=postgres JOBS=postgres`;
+- `DATABASE=postgres JOBS=postgres WEBHOOKS=durable`;
+- `DATABASE=postgres JOBS=postgres INBOUND_WEBHOOKS=standard-webhooks`;
+- `DATABASE=postgres OUTBOX=postgres MESSAGING=nats-jetstream`;
+- `MESSAGING=nats-jetstream`, `GRPC=enabled`, `AUTHN=oidc-jwt`,
+  `OUTBOUND_HTTP=bounded`, `OBJECT_STORAGE=s3`, and
+  `OUTBOUND_AUTH=oauth2-client-credentials` with HTTP, gRPC, or both.
+
+Other cross-products are not a supported preset merely because the initializer
+can mechanically resolve their markers.
+
+`init-module.sh` validates selections and identity before mutation, records an
+`initializing` journal, rewrites module/CODEOWNERS/service identity, physically
+removes unselected profiles, regenerates retained outputs, tidies modules, and
+marks `template.lock` complete only after postconditions pass. A same-selection
+rerun resumes or returns without drift; another identity or profile fails
+unchanged. The contract check captures the exact current working tree, clears
+ambient profile variables, and exercises the smallest representative profile
+rows plus partial-failure recovery.
+
+## Add an outbound integration
+
+```bash
+make integration-init NAME=billing TRANSPORT=http \
+  CONTRACT=api/external/billing/openapi.yaml TARGET=external-https AUTH=none
+```
+
+For explicitly requested initializer-harness verification, start with one named
+row. Run the complete matrix only when required by the task or existing CI gate;
+an ordinary integration change does not create that obligation:
+
+```bash
+bash scripts/ci/integration-init-check.sh --list
+INTEGRATION_INIT_ROWS=row_e1_http make integration-init-check
+make integration-init-check
+```
+
+## Verification continuation
+
+When expanded verification is explicitly selected, `make verify` prints its
+persistent attempt record in the Git-common
+`codex/verify` directory. It retains the full plan, candidate, environment,
+step starts, results, and durations even when a later step fails. The last
+state for a step applies; pending or running without a terminal result is
+unverified. A passed step is only a scoped result, and an invalidated attempt
+requires checking source stability before reusing any result.
+
+After repair, the delivery owner reconciles that plan and runs its missing or
+invalidated canonical commands under the
+[Evidence Contract](spec-first-workflow/shared/evidence-contract.md#execution-evidence).
+The attempt file does not cause automatic skipping or provide a passing
+aggregate receipt. Use `VERIFY_FORCE=1 make verify` when a fresh complete
+aggregate is required despite an otherwise reusable exact passing receipt.
+
+## Standalone Go diagnostics
+
+These commands serve debugging outside an implementation ledger or repairs
+inside its final validation. During ledger implementation,
+[Implementation](spec-first-workflow/phases/implementation.md#feedback-during-coding)
+owns the narrower coding-feedback allowance; these diagnostic targets do not
+automatically qualify.
+For a package-sized diagnostic, use:
+
+```bash
+make prove PKG=./path/to/changed/package FILES='path/to/changed.go'
+```
+
+When only the CLI exposes diagnostics, use `gopls check path/to/changed.go`.
+Use `gopls references file.go:line:column` before a semantic rename or exported
+signature change. `make test-watch` watches all Go directories but runs the
+package containing the saved file; press `a` for an explicit full run.
+`make lint-fast` remains a local changed-code signal; it is not a lint claim and
+is not required beside `make prove`.
+
+## Ordinary Go leaves
+
+The package aggregate is a standalone diagnostic tool. It is not an
+implementation task step and is unnecessary beside a covering final aggregate:
+
+```bash
+make prove \
+  PKG=./internal/<package> \
+  FILES="internal/<package>/a.go internal/<package>/a_test.go"
+```
+
+Ordinary local Go completion uses the matching deliverable build and relevant
+unit tests. For the main service and the ordinary root module:
+
+```bash
+make build
+ALLOW_FULL=1 make test-all
+```
+
+For a bounded change, use `make test-package PKG=...` and relevant reverse
+importers selected through existing tools. Build affected retained worker
+executables with their existing targets; do not create a profile matrix.
+`test-all` has neither integration tags nor race and is not `make check`.
+[Go Validation](validation/go.md) owns the full selection rules.
+
+`make verify` is an explicit expanded route, not a follow-up local completion
+gate. `make plan` diagnoses that route without running it: it collects base-branch,
+staged, unstaged, and untracked changes, including both sides of renames,
+explains their surfaces and not-applicable gates, and prints the minimal
+command set. Do not run it as a required gate; `make verify` already prints the
+plan it will execute.
+`verify` leaves heavy steps to CI unless `ALLOW_HEAVY=1` and rejects missing
+Docker or required binaries for its local steps before the first check. It batches changed Go formatting and lint packages, tests the
+reverse-importer closure, and serializes CPU/Docker work through the Git-common
+validation lock. Its exact passing receipt is shared by related worktrees and
+binds the resolved base, merge base, plan, execution inputs, tool versions, and
+candidate; a candidate change during execution invalidates the run.
+
+`scripts/dev/pre-push.sh` runs `make verify` as an opt-in Git pre-push hook,
+so lint and instruction failures stop the push instead of a CI round. Install
+it once per clone; linked worktrees share it:
+
+```bash
+ln -s ../../scripts/dev/pre-push.sh "$(git rev-parse --git-common-dir)/hooks/pre-push"
+```
+
+`git push --no-verify` skips it for one push.
+
+The explicit full-repository owner remains available when the claim spans it:
+
+```bash
+ALLOW_FULL=1 make check
+```
+
+`make check` runs formatting, `lint-all`, `test-all`, root-module tidy, and
+generated-contract drift. Do not append it to ordinary completion or run
+`fmt-check`, `lint-all`, or `test-all` beside it.
+
+Package-scoped names refuse a missing `PKG`; they do not default to `./...`:
+
+```bash
+make test-package PKG=./internal/<package>
+make lint-changed PKG=./internal/<package>
+make lint-changed PKGS='./internal/one ./internal/two'
+make lint-pr PKGS='./internal/<package>'
+ALLOW_FULL=1 make test-all
+ALLOW_FULL=1 make lint-all
+make fmt
+```
+
+Heavy leaves require `ALLOW_HEAVY=1` or `CI=true`:
+
+```bash
+ALLOW_HEAVY=1 make test-race
+ALLOW_HEAVY=1 make lint-deep
+ALLOW_HEAVY=1 make audit-full-manual
+```
+
+Use `make lint-deep` for explicitly required whole-program dead-code and nil
+analysis, and `make test-race` for explicitly required race verification. A
+concurrency label alone does not create a local race gate.
+`make audit-full-manual` is the rare template/release audit; it is not an
+iteration or ordinary pre-commit target. It builds one image and reuses it for
+migration rehearsal and image scanning.
+While editing one module, use `make root-mod-check` or `make tools-mod-check`.
+The tools module owns its own minimum Go version so a tooling update does not
+silently raise a service runtime's language/toolchain contract.
+`tools-dependencies-check` adds registered-tool resolution for a tools-module
+change; the combined `make mod-check` owns ordinary root/tools parity.
+
+## Generated contracts
+
+```bash
+make openapi-generate
+make openapi-check
+make sqlc-generate
+make sqlc-check
+```
+
+Checks run the canonical generator and a scoped Git diff. SQLC additionally
+rejects source/output stem mismatch or output without sources.
+
+<!-- profile:grpc:start -->
+```bash
+make proto-format
+make proto-generate
+make proto-check
+make proto-breaking BASE_REF=origin/main
+```
+
+Buf owns formatting, lint, generation, and breaking comparison. Generated Go
+is never edited manually.
+<!-- profile:grpc:end -->
+
+## PostgreSQL and integration
+
+```bash
+ALLOW_HEAVY=1 make test-integration-db
+ALLOW_HEAVY=1 make test-integration-messaging
+ALLOW_HEAVY=1 make test-integration-process
+ALLOW_HEAVY=1 make test-integration-race
+ALLOW_HEAVY=1 make test-integration
+```
+
+The first four targets own database, messaging, process, and concurrency
+surfaces. `test-integration` remains the full non-race pack; race is always an
+explicit separate claim. Add `REQUIRE_DOCKER=1` when Docker-backed proof must
+fail rather than skip.
+
+<!-- profile:database-postgres:start -->
+```bash
+make migration-check
+make migration-validate
+```
+
+`migration-check` combines Goose validation with append-only Git history in a
+derived repository. `migration-validate` uses disposable PostgreSQL, focused
+real-database tests, the production image migrator, readiness/version readback,
+and clean SIGTERM shutdown.
+<!-- profile:database-postgres:end -->
+
+<!-- profile:messaging-nats-jetstream:start -->
+`make test-messaging-race` owns the focused NATS lifecycle/race pack.
+<!-- profile:messaging-nats-jetstream:end -->
+<!-- profile:outbox-postgres:start -->
+`make test-outbox-race` owns the real-PostgreSQL outbox race pack.
+<!-- profile:outbox-postgres:end -->
+<!-- profile:webhooks-durable:start -->
+`make test-webhook-race` owns durable outbound-webhook race proof.
+<!-- profile:webhooks-durable:end -->
+
+## Instructions and template propagation
+
+```bash
+make agent-roles-check
+make codex-agents-check
+make claude-skills-check
+make qwen-skills-check
+make template-owned-purity-check
+```
+
+Use the single matching carrier check from
+[`validation/instructions.md`](validation/instructions.md) at final validation.
+The template purity target already runs every carrier check, so do not pair it
+with those leaves in the same final bundle.
+
+`scripts/harness-skills-sync.sh` is the one Claude/Qwen skill-view owner.
+`scripts/template-sync.sh` checks or applies one committed template snapshot to
+one target and leaves the result in that target's working tree.
+
+## Delivery and security
+
+For a relevant standalone diagnostic, native versions matching the Makefile pins
+can use the local-only fast targets. Explicit canonical verification uses
+`actionlint` or `shellcheck`; [Delivery Validation](validation/delivery.md) owns
+the pinned local binaries and CI fallback. These are not extra ordinary Go gates:
+
+```bash
+make actionlint-fast
+make shellcheck-fast
+```
+
+```bash
+make actionlint
+make shellcheck
+make dockerfile-check
+make govulncheck
+make gosec
+make secret-scan BASE_REF=origin/main
+make secret-scan-history
+```
+
+Gitleaks consumes the reviewed baseline. Local commands use the tools module;
+CI downloads a checksum-pinned binary whose version is read from that same
+module. The local secret-scan command checks the current tree and exact
+base-to-HEAD history.
+Clean pull-request CI scans only that commit range; push and release admission
+scan full history.
+
+## Runtime images
+
+```bash
+make runtime-image-build RUNTIME_IMAGE=service:ci
+make runtime-image-check RUNTIME_IMAGE=service:ci
+make container-security CONTAINER_IMAGE=service:ci
+```
+
+The source template builds one documented PostgreSQL generated output. A
+derived repository builds its own exact source. The lifecycle check starts a
+disposable PostgreSQL only when that current profile requires it; migration
+rehearsal reuses its own database. Reuse the same image tag for lifecycle,
+migration, and vulnerability scanning. The Dockerfile fixes output
+timestamps with `SOURCE_DATE_EPOCH=0`, so identical inputs rebuild to the same
+local image digest; application version and commit remain explicit build inputs.
+
+## Run and build
+
+```bash
+make run
+make build
+make pgo-manifest PGO_PROFILE=<representative-cpu.pprof> # requires provenance env; see Benchmarking
+make build-pgo PGO_PROFILE=<representative-cpu.pprof> PGO_MANIFEST=<representative-cpu.pprof.meta>
+make docker-build
+make docker-run
+```
+
+`run` sources `.env` when present. PGO requires an explicit CPU profile and its
+provenance manifest; `off` is the default and rollback. Off and PGO local
+binaries have distinct paths, `bin/service` and `bin/service-pgo`.
+
+<!-- profile:messaging-nats-jetstream:start -->
+`make run-worker` and `make build-worker` own the messaging worker.
+<!-- profile:messaging-nats-jetstream:end -->
+<!-- profile:outbox-postgres:start -->
+`make run-outbox-relay` and `make build-outbox-relay` own the outbox process.
+<!-- profile:outbox-postgres:end -->
+<!-- profile:jobs-postgres:start -->
+`make run-jobs-worker` and `make build-jobs-worker` own the jobs process.
+<!-- profile:jobs-postgres:end -->
+
+## Benchmarking
+
+Use `make benchmark-capture`, `benchmark-compare`, `benchmark-http`, and the
+profile commands from [Benchmarking](benchmarking.md). The capture owner records
+comparability metadata and rejects mismatched inputs before `benchstat`.
+Benchmarks are explicit evidence, not default CI gates; CI only runs the
+non-load `performance-harness-check` when its harness changes.
+
+## CI and publication
+
+`ci.yml` classifies the exact PR, merge-group, or main-push diff once, rejects
+unclassified paths, runs only matching leaves, and exposes one always-reported
+`required` context. PR jobs restore but do not save the separate root-module,
+tool-module, build, and lint caches; the main quality owner refreshes them.
+Generated Go, compose, publication metadata, and the messaging/outbox/webhook
+race owners route independently, and image-only work skips Go setup.
+`codeql.yml` uses the same exact-diff classifier, restores the module and build
+caches CI saves, and moves the module cache outside the checkout so CodeQL does
+not report dependency sources as repository code. `cd.yml` waits for
+exact-SHA CI and CodeQL before publishing through the digest-bound
+`publish-image` action. GitHub Rulesets remain external repository policy.

@@ -1,0 +1,49 @@
+title = "go-service-template-rest gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = "HTTP Idempotency-Key documentation examples in skill references"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''Idempotency-Key:\s*"?[A-Za-z0-9_-]+''']
+paths = ['''^(\.agents/skills/go-api-contract|\.(agents|claude|cursor|gemini|github|opencode)/skills/api-contract-designer[-]spec)/references/(async-operations-and-webhooks|idempotency-preconditions-retries)\.md$''']
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = "Historical cache-design prose that names key and value shape"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''key and value shape, freshness/TTL/invalidation/stampede behavior''']
+paths = ['''^\.agents/skills/go-db-cache-spec/SKILL\.md$''']
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = "Current and retired public AWS credentials module checksums in the removed S3 source receipt"
+condition = "AND"
+regexTarget = "match"
+regexes = ['''^credentials (v1\.19\.5 h1:xMo63RlqP3ZZydpJDMBsH9uJ10hgHYfQFIk1cHDXrR4|v1\.19\.34 h1:y6GkSmcv5myd1ngrYbGmiLlwQqB6TQhOuN/tbSSuWDY)='$''']
+paths = ['''^scripts/ci/s3-source-receipt\.sh$''']
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = "Current and retired public AWS credentials module checksums in the S3 design receipt"
+condition = "AND"
+regexTarget = "match"
+regexes = ['''^credentials (v1\.19\.5 h1:xMo63RlqP3ZZydpJDMBsH9uJ10hgHYfQFIk1cHDXrR4|v1\.19\.34 h1:y6GkSmcv5myd1ngrYbGmiLlwQqB6TQhOuN/tbSSuWDY)=$''']
+paths = ['''^specs/s3-compatible-object-storage/design/overview\.md$''']
+
+[[allowlists]]
+targetRules = ["curl-auth-header"]
+description = "Historical deterministic runtime-image Bearer canary in its original commit"
+condition = "AND"
+commits = ["10f72d71cd6182e3de56824d63cde646a45ed278"]
+paths = ['''^scripts/ci/runtime-image-build\.sh$''']
+
+[[allowlists]]
+targetRules = ["private-key"]
+description = "Public deterministic RSA fixtures used only to sign OIDC verifier test tokens"
+condition = "AND"
+paths = ['''^internal/infra/oidcjwt/testdata/test-key-[12]\.pem$''']

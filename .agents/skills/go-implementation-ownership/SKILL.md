@@ -1,0 +1,54 @@
+---
+name: go-implementation-ownership
+description: "Use when accepted Go behavior is closed but its package, file, canonical source, dependency direction, or proof location is not."
+metadata:
+  invocation: model
+  kind: method
+---
+
+# Go Implementation Ownership
+
+Every piece of logic, wiring, and proof has one **owner**. Two plausible owners
+means placement is not decided.
+
+`responsibilities -> owner -> dependency direction -> generated/manual authority -> proof placement -> cleanup`
+
+For a delegated Decision or Review, or when the active artifact requires its
+result interface, load the
+[shared specialist contract](../../contracts/specialist-contract.md).
+When meaningful ordering, comparison, exhaustive accounting, or a required
+decision/review handoff needs structured representation, build `OwnerRecord{responsibility,
+canonical_source, package, file, dependency_direction, sequence_owner,
+existing_proof_location_if_known, competing_paths, cleanup}` from accepted
+behavior through callers, wiring, generated and manual sources, and cleanup.
+Ownerless, duplicated, or competing production paths are findings. Implementation
+chooses new test cases, files, and proving layers while writing code; their
+absence does not block the ownership decision.
+Otherwise, a single local responsibility may retain its grounded ownership
+judgment and proof, including competing-path disposition.
+
+The nearest record wins: read package `doc.go`, `README.md`, and seam comments
+before [Repository Architecture](../../../docs/repo-architecture.md), [Project
+Structure](../../../docs/project-structure-and-module-organization.md), and
+[Configuration Source Policy](../../../docs/configuration-source-policy.md).
+Gates prove only what they inspect; use `.golangci.yml` and `scripts/ci/` to
+subtract mechanical coverage rather than treating green as ownership evidence.
+
+Cohesion: Group declarations that must be understood and changed together.
+Use package boundaries for dependency and API isolation, and files for
+navigable, cohesive behavior.
+
+Caller view: Exercise each new or changed package boundary from a real
+caller's perspective; make inputs, results, errors, and lifecycle
+obligations understandable without inspecting implementation details.
+
+Debug path: Walk a representative failure symptom through the proposed
+owners to the responsible rule, effect, and regression-test location.
+Reduce unrelated context needed to follow that path.
+
+For a **Decision**, apply Project Structure's placement rules and record forced
+consequences for every responsibility. For **Review**, account for every
+affected owner and competing path. Complete only when implementation can
+proceed from a current, unambiguous map of production packages, files, sources,
+and dependency boundaries. This method establishes code ownership, not an
+approved test plan or proof level before Implementation.

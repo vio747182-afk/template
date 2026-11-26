@@ -1,0 +1,246 @@
+package postgreswebhook
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptrace"
+	"net/netip"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/example/go-service-template-rest/internal/outboundtrust"
+	standardwebhooks "github.com/standard-webhooks/standard-webhooks/libraries/go"
+)
+
+const (
+	webhookUserAgent       = "go-service-template-webhook/1"
+	maxDNSAddresses        = 64
+	responseHeaderTimeout  = 15 * time.Second
+	tlsHandshakeTimeout    = 15 * time.Second
+	maxResponseHeaderBytes = 32 << 10
+)
+
+type deliveryAttempt struct {
+	DeliveryID              string
+	OwnerScope              string
+	ReceiverID              string
+	URL                     string
+	Body                    []byte
+	AttemptedAt             time.Time
+	Deadline                time.Time
+	ActiveKeyReference      string
+	PredecessorKeyReference string
+}
+
+type preparedSend struct {
+	Attempt   deliveryAttempt
+	URL       *url.URL
+	Addresses []netip.Addr
+	Signature string
+}
+
+type sendResult struct {
+	Evidence     transportEvidence
+	RetryAfter   string
+	ResponseDate string
+}
+
+func prepareSend(ctx context.Context, resolver *net.Resolver, attempt deliveryAttempt, manifest *SecretManifest) (preparedSend, error) {
+	if resolver == nil || manifest == nil || !attemptContextBounded(ctx, attempt.Deadline) {
+		return preparedSend{}, fmt.Errorf("%w: resolver, secret manifest, and bounded attempt deadline are required", ErrConfig)
+	}
+	parsed, err := parseWebhookURL(attempt.URL)
+	if err != nil {
+		return preparedSend{}, err
+	}
+	addresses, err := resolver.LookupNetIP(ctx, "ip", parsed.Hostname())
+	if err != nil {
+		return preparedSend{}, fmt.Errorf("resolve webhook destination: %w", err)
+	}
+	addresses, err = admitDestinationAddresses(addresses)
+	if err != nil {
+		return preparedSend{}, err
+	}
+
+	active, err := manifest.resolve(attempt.OwnerScope, attempt.ReceiverID, attempt.ActiveKeyReference)
+	if err != nil {
+		return preparedSend{}, err
+	}
+	var predecessor []byte
+	if attempt.PredecessorKeyReference != "" {
+		predecessor, err = manifest.resolve(attempt.OwnerScope, attempt.ReceiverID, attempt.PredecessorKeyReference)
+		if err != nil {
+			return preparedSend{}, err
+		}
+	}
+	signature, err := signV1(attempt.DeliveryID, attempt.AttemptedAt, attempt.Body, active, predecessor)
+	if err != nil {
+		return preparedSend{}, err
+	}
+	return preparedSend{Attempt: attempt, URL: parsed, Addresses: addresses, Signature: signature}, nil
+}
+
+func admitDestinationAddresses(addresses []netip.Addr) ([]netip.Addr, error) {
+	if len(addresses) == 0 || len(addresses) > maxDNSAddresses {
+		return nil, fmt.Errorf("%w: destination returned an invalid address count", errDestinationDenied)
+	}
+	addresses = slices.Clone(addresses)
+	for i := range addresses {
+		addresses[i] = addresses[i].Unmap()
+		if !outboundtrust.PublicAddress(addresses[i]) {
+			return nil, fmt.Errorf("%w: destination answer contains a non-public address", errDestinationDenied)
+		}
+	}
+	slices.SortFunc(addresses, func(a, b netip.Addr) int { return bytes.Compare(a.AsSlice(), b.AsSlice()) })
+	return slices.Compact(addresses), nil
+}
+
+// tryPreparedAddresses tries admitted DNS addresses in order, falling back only
+// when the preceding attempt is known not to have sent a request. Once a write
+// may have occurred, it returns immediately so retries retain the same stable
+// delivery ID without risking a duplicate side effect at another address.
+func tryPreparedAddresses(
+	ctx context.Context,
+	prepared preparedSend,
+	send func(context.Context, preparedSend, netip.Addr) (sendResult, error),
+) (sendResult, error) {
+	if len(prepared.Addresses) == 0 || send == nil {
+		return sendResult{Evidence: transportEvidence{Certainty: sendCertaintyDefinitelyNotSent, LocalPermanent: true}}, ErrConfig
+	}
+	var result sendResult
+	var err error
+	for _, address := range prepared.Addresses {
+		result, err = send(ctx, prepared, address)
+		if err == nil || result.Evidence.Certainty != sendCertaintyDefinitelyNotSent {
+			return result, err
+		}
+	}
+	return result, err
+}
+
+func send(ctx context.Context, prepared preparedSend, address netip.Addr) (sendResult, error) {
+	if prepared.URL == nil || !address.IsValid() || !attemptContextBounded(ctx, prepared.Attempt.Deadline) {
+		return sendResult{Evidence: transportEvidence{Certainty: sendCertaintyDefinitelyNotSent, LocalPermanent: true}}, fmt.Errorf("%w: prepared send is invalid", ErrConfig)
+	}
+	transport := newAttemptTransport(prepared.URL.Hostname(), address)
+	defer transport.CloseIdleConnections()
+	return sendWithTransport(ctx, prepared, transport)
+}
+
+func attemptContextBounded(ctx context.Context, attemptDeadline time.Time) bool {
+	deadline, ok := ctx.Deadline()
+	return ok && !attemptDeadline.IsZero() && !deadline.After(attemptDeadline)
+}
+
+func sendWithTransport(ctx context.Context, prepared preparedSend, transport *http.Transport) (sendResult, error) {
+	wroteRequest := false
+	trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest = true }}
+	request, err := webhookRequest(httptrace.WithClientTrace(ctx, trace), prepared)
+	if err != nil {
+		return sendResult{Evidence: transportEvidence{Certainty: sendCertaintyDefinitelyNotSent, LocalPermanent: true}}, err
+	}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Do(request)
+	if err != nil {
+		wrote := wroteRequest
+		// net/http exports no sentinel for MaxResponseHeaderBytes, so its text is matched.
+		if errors.Is(err, http.ErrLineTooLong) || strings.Contains(err.Error(), "server response headers exceeded") {
+			err = errResponseLimit
+		}
+		return sendResult{Evidence: transportEvidence{
+			Certainty:      certaintyForWrite(wrote),
+			LocalPermanent: !wrote && permanentTLSValidationError(err),
+		}}, fmt.Errorf("send webhook request: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	result := sendResult{
+		Evidence:   transportEvidence{StatusCode: response.StatusCode, Certainty: sendCertaintyMayHaveSent},
+		RetryAfter: response.Header.Get("Retry-After"), ResponseDate: response.Header.Get("Date"),
+	}
+	return result, nil
+}
+
+func certaintyForWrite(wrote bool) sendCertainty {
+	if wrote {
+		return sendCertaintyMayHaveSent
+	}
+	return sendCertaintyDefinitelyNotSent
+}
+
+func permanentTLSValidationError(err error) bool {
+	_, verification := errors.AsType[*tls.CertificateVerificationError](err)
+	_, unknownAuthority := errors.AsType[x509.UnknownAuthorityError](err)
+	_, hostname := errors.AsType[x509.HostnameError](err)
+	_, invalidCertificate := errors.AsType[x509.CertificateInvalidError](err)
+	return verification || unknownAuthority || hostname || invalidCertificate
+}
+
+func webhookRequest(ctx context.Context, prepared preparedSend) (*http.Request, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, prepared.URL.String(), bytes.NewReader(prepared.Attempt.Body))
+	if err != nil {
+		return nil, fmt.Errorf("build webhook request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept-Encoding", "identity")
+	request.Header.Set("User-Agent", webhookUserAgent)
+	request.Header.Set(standardwebhooks.HeaderWebhookID, prepared.Attempt.DeliveryID)
+	request.Header.Set(standardwebhooks.HeaderWebhookTimestamp, strconv.FormatInt(prepared.Attempt.AttemptedAt.Unix(), 10))
+	request.Header.Set(standardwebhooks.HeaderWebhookSignature, prepared.Signature)
+	return request, nil
+}
+
+func newAttemptTransport(serverName string, address netip.Addr) *http.Transport {
+	dialer := &net.Dialer{}
+	return &http.Transport{
+		Proxy: nil, DisableKeepAlives: true, DisableCompression: true, ForceAttemptHTTP2: false,
+		MaxConnsPerHost: 1, MaxIdleConns: 0, ResponseHeaderTimeout: responseHeaderTimeout,
+		MaxResponseHeaderBytes: maxResponseHeaderBytes,
+		TLSHandshakeTimeout:    tlsHandshakeTimeout,
+		TLSClientConfig:        &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS13},
+		TLSNextProto:           map[string]func(string, *tls.Conn) http.RoundTripper{},
+		// Dial only the admitted public address; the request host is never
+		// resolved again, so DNS cannot redirect the connection.
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			if !outboundtrust.PublicAddress(address) {
+				return nil, errDestinationDenied
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(address.String(), "443"))
+		},
+	}
+}
+
+var errDestinationURLDenied = fmt.Errorf("%w: destination URL must be absolute HTTPS on port 443", errDestinationDenied)
+
+func parseWebhookURL(raw string) (*url.URL, error) {
+	if len(raw) > 2048 {
+		return nil, errDestinationURLDenied
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, errDestinationURLDenied
+	}
+	if !acceptableWebhookURL(parsed) {
+		return nil, errDestinationURLDenied
+	}
+	if parsed.Port() == "" {
+		parsed.Host = net.JoinHostPort(parsed.Hostname(), "443")
+	}
+	return parsed, nil
+}
+
+// acceptableWebhookURL admits only an absolute HTTPS URL on port 443 with no
+// credentials, query, or fragment.
+func acceptableWebhookURL(u *url.URL) bool {
+	return u.Scheme == "https" && u.Hostname() != "" && u.User == nil &&
+		u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" &&
+		(u.Port() == "" || u.Port() == "443")
+}

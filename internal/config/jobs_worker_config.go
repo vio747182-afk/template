@@ -1,0 +1,75 @@
+package config
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/knadh/koanf/providers/confmap"
+	"github.com/knadh/koanf/v2"
+	"github.com/samber/lo"
+)
+
+func buildJobsWorkerSnapshot(source *koanf.Koanf) (Config, []string, error) {
+	// profile:inbound-webhooks-standard:start
+	if err := rejectJobsWorkerInboundSecrets(source); err != nil {
+		return Config{}, nil, err
+	}
+	// profile:inbound-webhooks-standard:end
+	values := lo.PickBy(source.All(), func(key string, _ any) bool {
+		return isJobsWorkerKey(key)
+	})
+
+	worker := koanf.New(keyDelimiter)
+	if err := worker.Load(confmap.Provider(values, keyDelimiter), nil); err != nil {
+		return Config{}, nil, fmt.Errorf("%w: load jobs worker configuration: %w", ErrLoad, err)
+	}
+	return buildSnapshot(worker)
+}
+
+// isJobsWorkerKey keeps the sections the jobs worker consumes. http stays because
+// its grace period and shutdown timeout bound the worker's teardown, and the
+// inbound endpoint document stays, without its secrets, so the worker can
+// require exactly one binding per configured endpoint.
+func isJobsWorkerKey(key string) bool {
+	sections := []string{"app", "http", "log", "observability", "postgres", "jobs"}
+	// profile:webhooks-durable:start
+	sections = append(sections, "webhooks")
+	// profile:webhooks-durable:end
+	for _, section := range sections {
+		if key == section || strings.HasPrefix(key, section+keyDelimiter) {
+			return true
+		}
+	}
+	// profile:inbound-webhooks-standard:start
+	if key == "inbound_webhooks.endpoints" {
+		return true
+	}
+	// profile:inbound-webhooks-standard:end
+	return false
+}
+
+func validateJobsWorkerConfig(cfg *Config) error {
+	if err := validateAppConfig(&cfg.App); err != nil {
+		return err
+	}
+	if err := validateHTTPConfig(&cfg.HTTP); err != nil {
+		return err
+	}
+	if err := validatePostgres(cfg.Postgres); err != nil {
+		return err
+	}
+	if err := validateJobs(cfg.Jobs, cfg.Postgres); err != nil {
+		return err
+	}
+	// profile:webhooks-durable:start
+	if err := validateJobsWorkerOutboundWebhooks(cfg.OutboundWebhooks); err != nil {
+		return err
+	}
+	// profile:webhooks-durable:end
+	// profile:inbound-webhooks-standard:start
+	if err := validateInboundWebhookEndpoints(cfg.InboundWebhooks.Endpoints); err != nil {
+		return err
+	}
+	// profile:inbound-webhooks-standard:end
+	return validateObservabilityConfig(&cfg.Observability)
+}

@@ -1,0 +1,88 @@
+package httpapi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/example/go-service-template-rest/examples/reference-service/internal/article"
+	"github.com/example/go-service-template-rest/examples/reference-service/internal/openapi"
+	"github.com/getkin/kin-openapi/openapi3filter"
+	oapimiddleware "github.com/oapi-codegen/nethttp-middleware"
+)
+
+// RejectFunc writes a transport-level rejection. The composition root supplies
+// these so this package maps the feature onto its contract without importing an
+// infra adapter to do it; see referenceservice.NewHandler for what it passes.
+type RejectFunc func(http.ResponseWriter, *http.Request, error)
+
+// Options carries what the composition root owns.
+type Options struct {
+	// Authenticate validates the security requirement this contract declares and
+	// publishes the caller it proved, so handlers can authorize without reading
+	// the credential a second time. The composition root builds it with
+	// httpx.Authenticated; no credential material reaches this package.
+	//
+	// Nil rejects every protected operation with 401, which is the correct
+	// default for a contract that declares a scheme nothing implements yet.
+	Authenticate openapi3filter.AuthenticationFunc
+	// RejectRequest maps a validator failure onto a response: an oversized body
+	// to 413, a failed security requirement to 401 with a WWW-Authenticate
+	// challenge, everything else to a sanitized 400.
+	RejectRequest RejectFunc
+	// RejectResponse maps an error a handler returns onto a response. It is the
+	// one place domain errors become statuses: the composition root builds it
+	// from the feature's classification table. A spent or canceled request
+	// answers 504, and an unclassified error 500.
+	RejectResponse RejectFunc
+}
+
+// NewAPIHandler wires the generated contract to the reference feature.
+//
+// It returns the API handler only — not a server-ready router. The middleware
+// chain that makes it safe to expose is applied by the composition root through
+// httpx.Harden, because a feature package must not import concrete infra
+// adapters. That the chain comes from shared code rather than being rebuilt here
+// is the point: a second hand-built chain is how a service ends up with none of
+// those protections while believing it inherited all of them.
+func NewAPIHandler(articles *article.Service, opts Options) (http.Handler, error) {
+	if articles == nil {
+		return nil, errors.New("reference api: article service is required")
+	}
+	if opts.RejectRequest == nil || opts.RejectResponse == nil {
+		return nil, errors.New("reference api: request and response rejection mappers are required")
+	}
+	spec, err := openapi.GetSpec()
+	if err != nil {
+		return nil, fmt.Errorf("reference api: load OpenAPI spec: %w", err)
+	}
+
+	validator := oapimiddleware.OapiRequestValidatorWithOptions(spec, &oapimiddleware.Options{
+		DoNotValidateServers: true,
+		// The spec's securitySchemes drive this call, so an operation marked
+		// protected cannot reach a handler without passing the check.
+		Options: openapi3filter.Options{
+			AuthenticationFunc: opts.Authenticate,
+		},
+		ErrorHandlerWithOpts: func(
+			_ context.Context,
+			err error,
+			w http.ResponseWriter,
+			r *http.Request,
+			_ oapimiddleware.ErrorHandlerOpts,
+		) {
+			opts.RejectRequest(w, r, err)
+		},
+	})
+
+	strict := openapi.NewStrictHandlerWithOptions(&handler{articles: articles}, nil, openapi.StrictHTTPServerOptions{
+		RequestErrorHandlerFunc:  opts.RejectRequest,
+		ResponseErrorHandlerFunc: opts.RejectResponse,
+	})
+
+	return openapi.HandlerWithOptions(strict, openapi.ChiServerOptions{
+		Middlewares:      []openapi.MiddlewareFunc{validator},
+		ErrorHandlerFunc: opts.RejectRequest,
+	}), nil
+}

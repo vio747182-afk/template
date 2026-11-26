@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Every canonical profile: name, module, service name, harness, then the
+# initialization overrides. --list-profiles prints the names CI splits into
+# parallel parts.
+profile_specs=(
+	"minimal github.com/acme/service service core"
+	"oidc-jwt github.com/acme/service service core AUTHN=oidc-jwt GRPC=enabled"
+	"oidc-introspection github.com/acme/service service core AUTHN=oidc-introspection GRPC=enabled"
+	"postgres github.com/acme/service service core DATABASE=postgres"
+	"http-idempotency github.com/acme/service service core DATABASE=postgres HTTP_IDEMPOTENCY=postgres"
+	"jobs github.com/acme/service service core DATABASE=postgres JOBS=postgres"
+	"webhooks github.com/acme/service service core DATABASE=postgres JOBS=postgres WEBHOOKS=durable"
+	"inbound-webhooks github.com/acme/service service core DATABASE=postgres JOBS=postgres INBOUND_WEBHOOKS=standard-webhooks"
+	"outbox github.com/acme/service service core DATABASE=postgres OUTBOX=postgres MESSAGING=nats-jetstream"
+	"messaging github.com/acme/service service core MESSAGING=nats-jetstream"
+	"object-storage github.com/acme/service service core OBJECT_STORAGE=s3"
+	"outbound-auth github.com/acme/service/v2 service all GRPC=enabled OUTBOUND_HTTP=bounded OUTBOUND_AUTH=oauth2-client-credentials AGENT_HARNESS=all"
+)
+
+if [[ ${1:-} == --list-profiles ]]; then
+	for spec in "${profile_specs[@]}"; do printf '%s\n' "${spec%% *}"; done
+	exit 0
+fi
+
+if [[ ${1:-} == --select-from-files ]]; then
+	# The optional base lets a change that deletes a marked file, or its
+	# markers, still select the profiles those markers belong to.
+	base=${2:-}
+	engine=false
+	selected=' '
+	add_selected() {
+		case "${selected}" in
+		*" $1 "*) return ;;
+		esac
+		selected+=" $1 "
+	}
+	marker_names() {
+		{
+			if [[ -f $1 ]]; then cat -- "$1"; fi
+			if [[ -n ${base} ]]; then git show "${base}:$1" 2>/dev/null || true; fi
+		} | grep -oE 'profile:[a-z0-9-]+:start' | sed -e 's/^profile://' -e 's/:start$//' | sort -u || true
+	}
+	# A changed file's markers select the canonical profile that keeps each
+	# block; minimal already renders every block removed. An unknown marker
+	# falls back to the engine set.
+	select_marker_profiles() {
+		local marker
+		while IFS= read -r marker; do
+			case "${marker}" in
+			authn-bearer | authn-oidc-jwt | grpc) add_selected oidc-jwt ;;
+			authn-oidc-introspection) add_selected oidc-introspection ;;
+			database-postgres) add_selected postgres ;;
+			http-idempotency-postgres) add_selected http-idempotency ;;
+			jobs-postgres) add_selected jobs ;;
+			webhooks-durable) add_selected webhooks ;;
+			inbound-webhooks-standard) add_selected inbound-webhooks ;;
+			outbox-postgres) add_selected outbox ;;
+			messaging-nats-jetstream) add_selected messaging ;;
+			object-storage) add_selected object-storage ;;
+			outbound-auth-*) add_selected outbound-auth ;;
+			*) engine=true ;;
+			esac
+		done < <(marker_names "$1")
+	}
+	while IFS= read -r file; do
+		[[ -n ${file} ]] || continue
+		case "${file}" in
+		scripts/init-module.sh | scripts/ci/init-module-contract-check.sh | scripts/ci/template-init-check.sh | template-owned.paths | template.lock | env/.env.example | env/config/*)
+			engine=true
+			continue
+			;;
+		scripts/profiles/authn-oidc-introspection* | *oauthintrospection*)
+			add_selected oidc-introspection
+			;;
+		scripts/profiles/authn-oidc-jwt* | *oidcjwt*)
+			add_selected oidc-jwt
+			;;
+		scripts/profiles/database-* | scripts/profiles/*postgres* | *http-idempotency*)
+			add_selected postgres
+			;;
+		scripts/profiles/jobs-* | */postgresjobs/*)
+			add_selected jobs
+			;;
+		*/webhooksecret/*)
+			add_selected webhooks
+			add_selected inbound-webhooks
+			;;
+		scripts/profiles/webhooks-* | */postgreswebhook/*)
+			add_selected webhooks
+			;;
+		scripts/profiles/inbound-* | */inboundwebhook* | */postgresinboundwebhook/*)
+			add_selected inbound-webhooks
+			;;
+		scripts/profiles/outbox-* | */postgresoutbox/*)
+			add_selected outbox
+			;;
+		scripts/profiles/messaging-* | */messagingconfig/* | */natsjs/*)
+			add_selected messaging
+			;;
+		scripts/profiles/object-storage* | */infra/s3/*)
+			add_selected object-storage
+			;;
+		scripts/profiles/outbound-auth* | */oauth2clientcredentials/*)
+			add_selected outbound-auth
+			;;
+		esac
+		select_marker_profiles "${file}"
+	done
+	# An engine change, or one no profile claims, adds the engine set to
+	# whatever the changed files selected.
+	if [[ ${engine} == true || ${selected} == ' ' ]]; then
+		add_selected oidc-jwt
+		add_selected postgres
+		add_selected outbound-auth
+	fi
+	# shellcheck disable=SC2086
+	printf '%s\n' minimal ${selected} | awk 'NF'
+	exit 0
+fi
+
+if [[ ! -d "${ROOT_DIR}/scripts/profiles" ]]; then
+	echo "initializer contract is template-only"
+	exit 0
+fi
+
+tmp="$(mktemp -d -t init-module-check.XXXXXX)"
+checkout="${tmp}/service"
+trap 'rm -rf -- "${tmp}"' EXIT
+mkdir -p "${checkout}"
+fixture_index="${tmp}/fixture.index"
+GIT_INDEX_FILE="${fixture_index}" git -C "${ROOT_DIR}" read-tree HEAD
+GIT_INDEX_FILE="${fixture_index}" git -C "${ROOT_DIR}" add -A
+fixture_tree="$(GIT_INDEX_FILE="${fixture_index}" git -C "${ROOT_DIR}" write-tree)"
+git -C "${ROOT_DIR}" archive "${fixture_tree}" | tar -xf - -C "${checkout}"
+git -C "${checkout}" init -q
+git -C "${checkout}" remote add origin git@github.com:acme/service.git
+
+git -C "${checkout}" add -A
+git -C "${checkout}" -c user.name=init-check -c user.email=init-check@example.invalid commit -qm baseline
+
+base_profile_env=(
+	CODEOWNER=@acme/platform
+	DATABASE=none
+	HTTP_IDEMPOTENCY=none
+	JOBS=none
+	WEBHOOKS=none
+	INBOUND_WEBHOOKS=none
+	OUTBOX=none
+	GRPC=none
+	AUTHN=none
+	OUTBOUND_HTTP=none
+	OBJECT_STORAGE=none
+	OUTBOUND_AUTH=none
+	MESSAGING=none
+	REFERENCE_EXAMPLE=remove
+	AGENT_HARNESS=core
+)
+
+run_init() {
+	local root="$1"
+	local module="$2"
+	shift 2
+	local command=(bash ./scripts/init-module.sh)
+	# The clean environment keeps caller input out of initialization, but an
+	# explicit module or build cache only says where downloads and builds
+	# live; without it every run re-downloads what CI already restored.
+	local caches=("") name
+
+	[[ -z "${module}" ]] || command+=("${module}")
+	for name in GOMODCACHE TOOL_GOMODCACHE GOCACHE; do
+		[[ -z ${!name:-} ]] || caches+=("${name}=${!name}")
+	done
+	(
+		cd "${root}"
+		env -i \
+			HOME="${HOME}" \
+			PATH="${PATH}" \
+			TMPDIR="${TMPDIR:-/tmp}" \
+			"${caches[@]:1}" \
+			GOMAXPROCS="${GOMAXPROCS:-${VALIDATION_JOBS:-2}}" \
+			VALIDATION_JOBS="${VALIDATION_JOBS:-2}" \
+			VALIDATION_PARALLEL_TESTS="${VALIDATION_PARALLEL_TESTS:-2}" \
+			"${base_profile_env[@]}" \
+			"$@" \
+			"${command[@]}"
+	)
+}
+
+unchanged_failure() {
+	local root="$1"
+	local module="$2"
+	shift 2
+
+	if run_init "${root}" "${module}" "$@" >/dev/null 2>&1; then
+		echo "initializer contract: expected unchanged failure: ${module} $*" >&2
+		exit 1
+	fi
+	git -C "${root}" diff --quiet
+	[[ -z "$(git -C "${root}" status --porcelain)" ]]
+}
+
+assert_no_profile_markers() {
+	local root="$1"
+
+	git -C "${root}" add -A
+	if git -C "${root}" grep --cached -n -E \
+		'profile:[a-z0-9-]+:(start|end)' -- \
+		':!scripts/init-module.sh' \
+		':!.agents/**'; then
+		echo "initializer contract: unresolved profile marker" >&2
+		exit 1
+	fi
+}
+
+assert_identity() {
+	local root="$1"
+	local module="$2"
+	local service_name="$3"
+	local harness="$4"
+	local rendered_lint_config
+
+	grep -Fxq "module ${module}" "${root}/go.mod"
+	grep -Fxq 'module go-service-template-tools' "${root}/tools/go.mod"
+	grep -Fxq 'state = "complete"' "${root}/template.lock"
+	grep -Fxq "module = \"${module}\"" "${root}/template.lock"
+	grep -Fxq 'original_module = "github.com/example/go-service-template-rest"' "${root}/template.lock"
+	grep -Fxq "service_name = \"${service_name}\"" "${root}/template.lock"
+	grep -Fxq 'codeowner = "@acme/platform"' "${root}/template.lock"
+	grep -Fxq "agent_harness = \"${harness}\"" "${root}/template.lock"
+	test "$(make -s -C "${root}" --no-print-directory print-service-name)" = "${service_name}"
+	grep -Fq '__MODULE__/internal' "${root}/.golangci.yml"
+	rendered_lint_config=$(cd "${root}" && bash ./scripts/ci/golangci-lint.sh --render-config)
+	grep -Fq "${module}/internal" <<<"${rendered_lint_config}"
+	if grep -Fq '__MODULE__/internal' <<<"${rendered_lint_config}"; then return 1; fi
+	if grep -Fq '__MODULE_REGEX__' <<<"${rendered_lint_config}"; then return 1; fi
+	awk -v key='"observability.otel.service_name":' -v value="\"${service_name}\"" '
+		index($0, key) && index($0, value) { found = 1 }
+		END { exit !found }
+	' "${root}/internal/config/observability_config.go"
+	grep -Fq "\"service.name\", \"${service_name}\"" "${root}/cmd/service/internal/bootstrap/run.go"
+	grep -Fxq "APP__OBSERVABILITY__OTEL__SERVICE_NAME=${service_name}" "${root}/env/.env.example"
+	grep -Fq "title: \"${service_name}\"" "${root}/api/openapi/service.yaml"
+	grep -Fxq "# ${service_name}" "${root}/README.md"
+	grep -Fxq "Module: \`${module}\`" "${root}/README.md"
+	awk '
+		/^[[:space:]]*#/ { next }
+		/@Dankosik/ { stale = 1 }
+		/@acme\/platform/ { found = 1 }
+		END { exit !(found && !stale) }
+	' "${root}/.github/CODEOWNERS"
+	test -x "${root}/scripts/ci/init-module-contract-check.sh"
+	test ! -e "${root}/scripts/profiles"
+	assert_no_profile_markers "${root}"
+}
+
+assert_harness() {
+	local root="$1"
+	local harness="$2"
+
+	case "${harness}" in
+	core)
+		test ! -e "${root}/.claude"
+		test ! -e "${root}/.qwen"
+		test ! -e "${root}/.codex"
+		test ! -e "${root}/.cursor/agents"
+		test -d "${root}/.cursor/rules"
+		test ! -e "${root}/.grok"
+		test ! -e "${root}/.opencode"
+		test ! -e "${root}/opencode.json"
+		;;
+	all)
+		test -d "${root}/.claude/agents"
+		test -d "${root}/.qwen/agents"
+		test -d "${root}/.codex/agents"
+		test -d "${root}/.cursor/agents"
+		test -d "${root}/.grok/agents"
+		test -d "${root}/.opencode/agents"
+		test -f "${root}/opencode.json"
+		;;
+	esac
+}
+
+assert_profile() {
+	local root="$1"
+	local name="$2"
+	local dependencies=""
+
+	case "${name}" in
+	oidc-jwt | oidc-introspection)
+		dependencies="$(cd "${root}" && go list -deps ./cmd/service)"
+		;;
+	esac
+	case "${name}" in
+	minimal)
+		test ! -d "${root}/internal/infra/postgres"
+		test ! -d "${root}/internal/webhooksecret"
+		test ! -d "${root}/internal/infra/bearerauthn"
+		test ! -d "${root}/internal/infra/natsjs"
+		test ! -d "${root}/internal/messagingconfig"
+		test "$(make -s -C "${root}" --no-print-directory run-worker)" = 'not applicable: no messaging worker'
+		test "$(make -s -C "${root}" --no-print-directory template-init)" = 'not applicable: repository initialization is already complete'
+		;;
+	oidc-jwt)
+		test -d "${root}/internal/infra/oidcjwt"
+		test ! -d "${root}/internal/infra/oauthintrospection"
+		grep -Fq 'internal/infra/oidcjwt' <<<"${dependencies}"
+		grep -Fq 'TokenProfile' "${root}/internal/config/authn_config.go"
+		! grep -Fq 'IntrospectionEndpoint' "${root}/internal/config/authn_config.go"
+		;;
+	oidc-introspection)
+		test -d "${root}/internal/infra/oauthintrospection"
+		test ! -d "${root}/internal/infra/oidcjwt"
+		grep -Fq 'internal/infra/oauthintrospection' <<<"${dependencies}"
+		grep -Fq 'IntrospectionEndpoint' "${root}/internal/config/authn_config.go"
+		! grep -Fq 'TokenProfile' "${root}/internal/config/authn_config.go"
+		! grep -E 'MicahParks/(keyfunc|jwkset)|golang-jwt/jwt' <<<"${dependencies}"
+		;;
+	postgres)
+		test -d "${root}/internal/infra/postgres"
+		test ! -e "${root}/migrations/000008_river.sql"
+		test ! -e "${root}/migrations/000011_river_job_id_autoincrement.sql"
+		! find "${root}/migrations" -type f -name '*_postgres_outbox*.sql' -print -quit 2>/dev/null | grep -q .
+		;;
+	http-idempotency)
+		test -d "${root}/internal/infra/postgresidempotency"
+		test -e "${root}/migrations/000003_postgres_http_idempotency.sql"
+		;;
+	jobs)
+		test -d "${root}/cmd/jobs-worker"
+		test ! -e "${root}/migrations/000004_postgres_jobs.sql"
+		test -e "${root}/migrations/000008_river.sql"
+		test -e "${root}/migrations/000011_river_job_id_autoincrement.sql"
+		;;
+	webhooks)
+		test -d "${root}/internal/infra/postgreswebhook"
+		test -d "${root}/internal/webhooksecret"
+		test ! -d "${root}/internal/infra/postgresinboundwebhook"
+		test -d "${root}/cmd/jobs-worker"
+		test ! -e "${root}/migrations/000004_postgres_jobs.sql"
+		test ! -e "${root}/migrations/000005_postgres_webhooks.sql"
+		test ! -e "${root}/migrations/000006_postgres_webhook_reference_repairs.sql"
+		test ! -e "${root}/migrations/000007_postgres_webhooks_retire.sql"
+		test -e "${root}/migrations/000008_river.sql"
+		test -e "${root}/migrations/000011_river_job_id_autoincrement.sql"
+		;;
+	inbound-webhooks)
+		test -d "${root}/internal/inboundwebhook/manifest"
+		test -d "${root}/internal/infra/postgresinboundwebhook"
+		test -d "${root}/internal/webhooksecret"
+		test ! -d "${root}/internal/infra/postgreswebhook"
+		test -e "${root}/migrations/000010_postgres_inbound_webhooks.sql"
+		;;
+	outbox)
+		test -d "${root}/internal/infra/postgresoutbox"
+		test ! -e "${root}/migrations/000001_postgres_outbox.sql"
+		test -e "${root}/migrations/000008_river.sql"
+		test -e "${root}/migrations/000011_river_job_id_autoincrement.sql"
+		! grep -R -E 'type Outbox(Event|CommitReceipt|OrderingHead|Redrife)' "${root}/internal/infra/postgres/sqlcgen" 2>/dev/null
+		;;
+	messaging)
+		test -d "${root}/internal/messagingconfig"
+		test -d "${root}/internal/infra/natsjs"
+		test -d "${root}/cmd/worker"
+		test ! -d "${root}/internal/infra/postgres"
+		;;
+	object-storage)
+		test -d "${root}/internal/infra/s3"
+		;;
+	outbound-auth)
+		test -d "${root}/internal/infra/oauth2clientcredentials"
+		test -f "${root}/internal/infra/oauth2clientcredentials/http.go"
+		test -f "${root}/internal/infra/oauth2clientcredentials/grpc.go"
+		;;
+	esac
+}
+
+# assert_role_isolation keeps each role's composition private now that the one
+# cmd/entrypoint executable links every selected role: no role package reaches
+# another role's packages or cmd/entrypoint, and the service role never reaches
+# the migration adapter, so application startup still never migrates.
+assert_role_isolation() {
+	local root="$1"
+	local roles=(service worker jobs-worker outbox-relay migrate)
+	local module role other dependencies service_dependencies=''
+	module="$(cd "${root}" && go list -m)"
+	for role in "${roles[@]}"; do
+		[[ -d "${root}/cmd/${role}" ]] || continue
+		dependencies="$(cd "${root}" && go list -deps "./cmd/${role}")"
+		[[ ${role} != service ]] || service_dependencies="${dependencies}"
+		for other in "${roles[@]}" entrypoint; do
+			[[ ${other} != "${role}" ]] || continue
+			if awk -v p="${module}/cmd/${other}" '$0 == p || index($0, p "/") == 1 { found = 1 } END { exit !found }' <<<"${dependencies}"; then
+				echo "init-module contract: cmd/${role} reaches cmd/${other} in ${root}" >&2
+				return 1
+			fi
+		done
+	done
+	if grep -Fxq "${module}/internal/infra/postgresmigrate" <<<"${service_dependencies}"; then
+		echo "init-module contract: cmd/service reaches internal/infra/postgresmigrate in ${root}" >&2
+		return 1
+	fi
+}
+
+verify_template_sync() {
+	local root="$1"
+	local harness="$2"
+
+	bash "${root}/scripts/template-sync.sh" --apply --from "${checkout}" --repo "${root}"
+	bash "${root}/scripts/template-sync.sh" --check --from "${checkout}" --repo "${root}"
+	assert_harness "${root}" "${harness}"
+}
+
+verify_profile() {
+	local name="$1"
+	local module="$2"
+	local service_name="$3"
+	local harness="$4"
+	shift 4
+	local overrides=("")
+	local override
+	local profile_checkout="${tmp}/service-${name}"
+	for override in "$@"; do overrides+=("${override}"); done
+
+	git clone -q "${checkout}" "${profile_checkout}"
+	git -C "${profile_checkout}" remote set-url origin git@github.com:acme/service.git
+	run_init "${profile_checkout}" "${module}" "${overrides[@]:1}"
+	assert_identity "${profile_checkout}" "${module}" "${service_name}" "${harness}"
+	assert_profile "${profile_checkout}" "${name}"
+	assert_role_isolation "${profile_checkout}"
+	assert_harness "${profile_checkout}" "${harness}"
+	(
+		cd "${profile_checkout}"
+		go test -vet=off -run '^$' ./...
+		GOFLAGS='' go mod tidy -diff
+		if [[ "${name}" == "minimal" ]]; then
+			if [[ ${INIT_MODULE_RESOLVE_TOOLS:-} == 1 ]]; then
+				TOOLS_RESOLUTION_ALL=1 make tools-dependencies-check
+			else
+				make tools-mod-check
+			fi
+		fi
+		make fmt-check openapi-drift-check sqlc-check
+		git add -A
+		git -c user.name=init-check -c user.email=init-check@example.invalid commit -qm generated
+	)
+
+	if [[ "${name}" == "minimal" || "${harness}" == "all" ]]; then
+		verify_template_sync "${profile_checkout}" "${harness}"
+	fi
+	if [[ "${name}" == "minimal" ]]; then
+		run_init "${profile_checkout}" "${module}" "${overrides[@]:1}" >/dev/null
+		git -C "${profile_checkout}" diff --quiet
+		[[ -z "$(git -C "${profile_checkout}" status --porcelain)" ]]
+		unchanged_failure "${profile_checkout}" github.com/acme/other "${overrides[@]:1}"
+	fi
+}
+
+# The canonical re-run, the refusals and the resumed partial failure do not
+# depend on a profile. They run by default; CI runs them in one part and sets
+# INIT_MODULE_SHARED_CHECKS=0 in the others.
+shared_checks() {
+	canonical_checkout="${tmp}/canonical-source"
+	git clone -q "${checkout}" "${canonical_checkout}"
+	git -C "${canonical_checkout}" remote set-url origin https://github.com/Dankosik/go-service-template-rest.git
+	run_init "${canonical_checkout}" "" >/dev/null
+	git -C "${canonical_checkout}" diff --quiet
+	[[ -z "$(git -C "${canonical_checkout}" status --porcelain)" ]]
+	unchanged_failure "${canonical_checkout}" github.com/acme/forbidden
+
+	unchanged_failure "${checkout}" "" CODEOWNER=
+	unchanged_failure "${checkout}" "" GRPC=
+	unchanged_failure "${checkout}" "" GRPC=custom
+	unchanged_failure "${checkout}" 'bad module'
+	unchanged_failure "${checkout}" github.com/example/go-service-template-rest
+	unchanged_failure "${checkout}" "" HTTP_IDEMPOTENCY=postgres
+	unchanged_failure "${checkout}" "" JOBS=postgres
+	unchanged_failure "${checkout}" "" WEBHOOKS=durable
+	unchanged_failure "${checkout}" "" INBOUND_WEBHOOKS=standard-webhooks
+	unchanged_failure "${checkout}" "" OUTBOX=postgres MESSAGING=nats-jetstream
+	unchanged_failure "${checkout}" "" DATABASE=postgres OUTBOX=postgres
+
+	partial_checkout="${tmp}/service-partial"
+	git clone -q "${checkout}" "${partial_checkout}"
+	git -C "${partial_checkout}" remote set-url origin git@github.com:acme/service.git
+	fail_bin="${tmp}/fail-bin"
+	mkdir -p "${fail_bin}"
+	real_go="$(command -v go)"
+	cat >"${fail_bin}/go" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1-}" == tool && "\${2-}" == -modfile=tools/go.mod && "\${3-}" == sqlc && "\${4-}" == generate ]] &&
+	grep -Fxq 'state = "initializing"' template.lock 2>/dev/null; then
+	exit 97
+fi
+exec "${real_go}" "\$@"
+EOF
+	chmod +x "${fail_bin}/go"
+	if run_init "${partial_checkout}" github.com/acme/service DATABASE=postgres HTTP_IDEMPOTENCY=postgres "PATH=${fail_bin}:${PATH}" >/dev/null 2>&1; then
+		echo "initializer contract: injected partial failure unexpectedly succeeded" >&2
+		exit 1
+	fi
+	grep -Fxq 'state = "initializing"' "${partial_checkout}/template.lock"
+	test -d "${partial_checkout}/scripts/profiles"
+	run_init "${partial_checkout}" github.com/acme/service DATABASE=postgres HTTP_IDEMPOTENCY=postgres >/dev/null
+	assert_identity "${partial_checkout}" github.com/acme/service service core
+	unformatted=$(cd "${partial_checkout}" && gofmt -l internal/config cmd/service/internal/bootstrap)
+	[[ -z ${unformatted} ]] || { echo "resumed initialization left unformatted Go files: ${unformatted}" >&2; exit 1; }
+}
+
+if [[ ${INIT_MODULE_SHARED_CHECKS:-1} == 1 ]]; then
+	shared_checks
+fi
+
+run_selected_profile() {
+	local name=$1
+	shift
+	if [[ -n ${INIT_MODULE_PROFILES:-} ]]; then
+		case " ${INIT_MODULE_PROFILES} " in
+		*" ${name} "*) ;;
+		*) return 0 ;;
+		esac
+	fi
+	verify_profile "${name}" "$@"
+}
+
+for spec in "${profile_specs[@]}"; do
+	read -r -a profile_args <<<"${spec}"
+	run_selected_profile "${profile_args[@]}"
+done
+
+echo "initializer contract passed"

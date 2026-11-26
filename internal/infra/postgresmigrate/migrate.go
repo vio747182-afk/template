@@ -1,0 +1,375 @@
+package postgresmigrate
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"path/filepath"
+	"time"
+
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/database"
+	gooselock "github.com/pressly/goose/v3/lock"
+)
+
+type MigrationOptions struct {
+	DSN              string
+	SourceFS         fs.FS
+	SourcePath       string
+	ConnectTimeout   time.Duration
+	StatementTimeout time.Duration
+	LockTimeout      time.Duration
+	CleanupTimeout   time.Duration
+	Logger           *slog.Logger
+}
+
+const (
+	DefaultTimeout          = 5 * time.Minute
+	DefaultConnectTimeout   = 3 * time.Second
+	DefaultStatementTimeout = 2 * time.Minute
+	DefaultLockTimeout      = 15 * time.Second
+	DefaultCleanupTimeout   = 15 * time.Second
+)
+
+func DefaultOptions(dsn string, source fs.FS, path string, logger *slog.Logger) MigrationOptions {
+	return MigrationOptions{
+		DSN:              dsn,
+		SourceFS:         source,
+		SourcePath:       path,
+		ConnectTimeout:   DefaultConnectTimeout,
+		StatementTimeout: DefaultStatementTimeout,
+		LockTimeout:      DefaultLockTimeout,
+		CleanupTimeout:   DefaultCleanupTimeout,
+		Logger:           logger,
+	}
+}
+
+type migrationDirection string
+
+const (
+	directionUp   migrationDirection = "up"
+	directionDown migrationDirection = "down"
+)
+
+// MigrateUp applies every pending canonical migration under the Goose session lock.
+// On error, its RunResult can describe partial completed work but is not an
+// authoritative read of current database state.
+func MigrateUp(ctx context.Context, opts MigrationOptions) (RunResult, error) {
+	return migrate(ctx, opts, directionUp)
+}
+
+// MigrateDown rolls every applied migration back on a disposable database. On
+// error, its RunResult can describe partial completed work but is not an
+// authoritative read of current database state.
+//
+// Production composition deliberately exposes only MigrateUp.
+func MigrateDown(ctx context.Context, opts MigrationOptions) (RunResult, error) {
+	return migrate(ctx, opts, directionDown)
+}
+
+func migrate(
+	ctx context.Context,
+	opts MigrationOptions,
+	direction migrationDirection,
+) (result RunResult, retErr error) {
+	started := time.Now()
+	defer func() {
+		result.Duration = time.Since(started)
+	}()
+
+	source, err := rootMigrationSource(opts.SourceFS, opts.SourcePath)
+	if err != nil {
+		return result, stageError(FailureSource, err)
+	}
+	if err := validateMigrationOptions(opts); err != nil {
+		return result, stageError(FailureConfig, err)
+	}
+
+	executionCtx, cancelExecution, err := executionContext(ctx, opts.CleanupTimeout)
+	if err != nil {
+		return result, stageError(FailureConfig, err)
+	}
+	defer cancelExecution()
+
+	db, err := openMigrationDB(opts)
+	if err != nil {
+		return result, stageError(FailureConfig, err)
+	}
+	// goose Provider.Close only closes db, so closing db covers both.
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			retErr = withMigrationCleanup(retErr, fmt.Errorf("close postgres migration database: %w", closeErr))
+		}
+	}()
+
+	// WithLockTimeout(period, attempts): retry every second for the whole budget.
+	// CleanupTimeout serves twice: it bounds the unlock retries here and is the
+	// reserve kept back from the execution deadline for cleanup.
+	locker, err := gooselock.NewPostgresSessionLocker(
+		gooselock.WithLockTimeout(1, secondsCeiling(opts.LockTimeout)),
+		gooselock.WithUnlockTimeout(1, secondsCeiling(opts.CleanupTimeout)),
+	)
+	if err != nil {
+		return result, stageError(FailureConfig, fmt.Errorf("build goose session locker: %w", err))
+	}
+	stagedLocker := migrationSessionLocker{SessionLocker: locker}
+
+	provider, err := goose.NewProvider(
+		goose.DialectPostgres,
+		db,
+		source,
+		goose.WithDisableGlobalRegistry(true),
+		goose.WithLogger(goose.NopLogger()),
+		goose.WithSessionLocker(stagedLocker),
+		goose.WithVerbose(false),
+	)
+	if err != nil {
+		if errors.Is(err, goose.ErrNoMigrations) {
+			if pingErr := db.PingContext(executionCtx); pingErr != nil {
+				return result, stageError(
+					FailureConnect,
+					fmt.Errorf("ping postgres migration database: %w", pingErr),
+				)
+			}
+			return migrateEmptySource(ctx, executionCtx, opts, db, stagedLocker, direction, result)
+		}
+		return result, stageError(FailureSource, fmt.Errorf("build goose provider: %w", err))
+	}
+	if err := provider.Ping(executionCtx); err != nil {
+		return result, stageError(FailureConnect, fmt.Errorf("ping postgres migration database: %w", err))
+	}
+
+	current, target, err := provider.GetVersions(executionCtx)
+	if err != nil {
+		return result, stageError(FailureState, fmt.Errorf("read goose migration versions: %w", err))
+	}
+	result.recordVersions(current, target)
+	if direction == directionDown {
+		result.Target = 0
+	}
+	sources := provider.ListSources()
+	logMigrationPlan(executionCtx, opts.Logger, direction, result.Before, result.Target, len(sources))
+
+	var gooseResults []*goose.MigrationResult
+	if direction == directionUp {
+		gooseResults, err = provider.Up(executionCtx)
+	} else {
+		gooseResults, err = provider.DownTo(executionCtx, 0)
+	}
+	applied := gooseResults
+	var failed *goose.MigrationResult
+	if err != nil {
+		if partial, ok := errors.AsType[*goose.PartialError](err); ok {
+			applied = partial.Applied
+			failed = partial.Failed
+		}
+		setAfterFromApplied(&result, direction, sources, applied)
+		logMigrationResults(executionCtx, opts.Logger, applied, failed)
+		if stage := FailureStageOf(err); stage == FailureLock || stage == FailureCleanup {
+			return result, fmt.Errorf("run goose migration: %w", err)
+		}
+		return result, stageError(FailureExecute, err)
+	}
+
+	setAfterFromApplied(&result, direction, sources, applied)
+	after, _, stateErr := provider.GetVersions(executionCtx)
+	if stateErr != nil {
+		logMigrationResults(executionCtx, opts.Logger, applied, nil)
+		return result, stageError(FailureState, fmt.Errorf("read goose migration versions: %w", stateErr))
+	}
+	// goose GetVersions does not take the session lock, so the first read can
+	// predate a concurrent runner that finished while this one waited. A run that
+	// applied nothing reports the later read as Before.
+	if len(applied) == 0 {
+		result.Before = after
+	}
+	result.After = after
+	logMigrationResults(executionCtx, opts.Logger, applied, nil)
+	return result, nil
+}
+
+type migrationSessionLocker struct {
+	gooselock.SessionLocker
+}
+
+func (l migrationSessionLocker) SessionLock(ctx context.Context, conn *sql.Conn) error {
+	if err := l.SessionLocker.SessionLock(ctx, conn); err != nil {
+		return stageError(FailureLock, err)
+	}
+	return nil
+}
+
+func (l migrationSessionLocker) SessionUnlock(ctx context.Context, conn *sql.Conn) error {
+	if err := l.SessionLocker.SessionUnlock(ctx, conn); err != nil {
+		return stageError(FailureCleanup, err)
+	}
+	return nil
+}
+
+func migrateEmptySource(
+	parent context.Context,
+	executionCtx context.Context,
+	opts MigrationOptions,
+	db *sql.DB,
+	locker gooselock.SessionLocker,
+	direction migrationDirection,
+	result RunResult,
+) (RunResult, error) {
+	lockConn, err := acquireMigrationLock(executionCtx, db, locker, opts.LockTimeout)
+	if err != nil {
+		return result, err
+	}
+
+	cleanup := func() error {
+		return cleanupMigrationResources(parent, opts.CleanupTimeout, locker, lockConn)
+	}
+	store, err := database.NewStore(database.DialectPostgres, goose.DefaultTablename)
+	if err != nil {
+		return result, withMigrationCleanup(
+			stageError(FailureConfig, fmt.Errorf("build goose postgres store: %w", err)),
+			cleanup(),
+		)
+	}
+	version, err := emptySourceVersion(executionCtx, lockConn, store)
+	if err != nil {
+		return result, withMigrationCleanup(stageError(FailureState, err), cleanup())
+	}
+	result.recordVersions(version, 0)
+	logMigrationPlan(executionCtx, opts.Logger, direction, version, 0, 0)
+	return result, withMigrationCleanup(nil, cleanup())
+}
+
+func acquireMigrationLock(
+	ctx context.Context,
+	db *sql.DB,
+	locker gooselock.SessionLocker,
+	timeout time.Duration,
+) (*sql.Conn, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, stageError(
+			FailureConnect,
+			fmt.Errorf("acquire postgres migration lock connection: %w", err),
+		)
+	}
+
+	lockCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := locker.SessionLock(lockCtx, conn); err != nil {
+		return nil, stageError(FailureLock, errors.Join(
+			fmt.Errorf("acquire goose session lock: %w", err),
+			conn.Close(),
+		))
+	}
+	return conn, nil
+}
+
+func validateMigrationOptions(opts MigrationOptions) error {
+	if opts.ConnectTimeout <= 0 {
+		return errors.New("postgres migration connect timeout must be > 0")
+	}
+	if opts.StatementTimeout <= 0 {
+		return errors.New("postgres migration statement timeout must be > 0")
+	}
+	if opts.LockTimeout <= 0 {
+		return errors.New("postgres migration lock timeout must be > 0")
+	}
+	if opts.CleanupTimeout <= 0 {
+		return errors.New("postgres migration cleanup timeout must be > 0")
+	}
+	return nil
+}
+
+func withMigrationCleanup(primary, cleanupErr error) error {
+	if cleanupErr == nil {
+		return primary
+	}
+	return stageError(FailureCleanup, errors.Join(primary, cleanupErr))
+}
+
+func cleanupMigrationResources(
+	parent context.Context,
+	budget time.Duration,
+	locker gooselock.SessionLocker,
+	conn *sql.Conn,
+) error {
+	cleanupCtx, cancel := detachedCleanupContext(parent, budget)
+	defer cancel()
+
+	var cleanupErr error
+	if locker != nil && conn != nil {
+		if err := locker.SessionUnlock(cleanupCtx, conn); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("release goose session lock: %w", err))
+		}
+	}
+	if conn != nil {
+		if err := conn.Close(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close postgres migration lock connection: %w", err))
+		}
+	}
+	return cleanupErr
+}
+
+func logMigrationPlan(
+	ctx context.Context,
+	logger *slog.Logger,
+	direction migrationDirection,
+	current int64,
+	target int64,
+	sourceCount int,
+) {
+	if logger == nil {
+		return
+	}
+	logger.InfoContext(
+		ctx,
+		"migration_plan",
+		"migration.direction", string(direction),
+		"migration.before", current,
+		"migration.target", target,
+		"migration.source_count", sourceCount,
+	)
+}
+
+func logMigrationResults(
+	ctx context.Context,
+	logger *slog.Logger,
+	applied []*goose.MigrationResult,
+	failed *goose.MigrationResult,
+) {
+	if logger == nil {
+		return
+	}
+	for _, migration := range applied {
+		logMigrationResult(ctx, logger, migration, false)
+	}
+	if failed != nil {
+		logMigrationResult(ctx, logger, failed, true)
+	}
+}
+
+func logMigrationResult(ctx context.Context, logger *slog.Logger, migration *goose.MigrationResult, failed bool) {
+	if migration == nil || migration.Source == nil {
+		return
+	}
+	outcome := "success"
+	if failed {
+		outcome = "error"
+	}
+	attrs := []any{
+		"migration.version", migration.Source.Version,
+		"migration.filename", filepath.Base(migration.Source.Path),
+		"migration.direction", migration.Direction,
+		"migration.duration", migration.Duration,
+		"migration.empty", migration.Empty,
+		"outcome", outcome,
+	}
+	if failed {
+		logger.ErrorContext(ctx, "migration_result", attrs...)
+		return
+	}
+	logger.InfoContext(ctx, "migration_result", attrs...)
+}

@@ -1,0 +1,43 @@
+# Async Architecture
+
+Load for a queue, job, outbox, webhook, event, or background-process change.
+
+<!-- profile:outbox-postgres:start -->
+The PostgreSQL outbox appends a typed event as a River job in the same `pgx.Tx`
+as the mutation. `internal/infra/natsjs` maps event versions to subjects and
+publishes stored jobs; `cmd/outbox-relay` owns the worker process. Profile
+initialization requires both outbox and NATS.
+<!-- profile:outbox-postgres:end -->
+
+<!-- profile:jobs-postgres:start -->
+The PostgreSQL jobs pack delegates queue state and lifecycle to River, retains a
+separate worker role and process, stays inert without a business worker builder, and uses
+`InsertTx` for caller-owned transactions.
+<!-- profile:jobs-postgres:end -->
+
+<!-- profile:webhooks-durable:start -->
+Durable webhooks prepare immutable fan-out before the feature transaction and
+insert one River job per receiver inside it. `cmd/jobs-worker` runs the worker;
+the adapter signs one bounded public-HTTPS request and maps the outcome into
+River's completion/retry contract.
+<!-- profile:webhooks-durable:end -->
+
+<!-- profile:inbound-webhooks-standard:start -->
+Inbound webhooks insert one receipt and one River job in the same PostgreSQL
+transaction. The jobs worker reloads the verified receipt by internal ID,
+invokes one typed binding, and writes the terminal outcome on the receipt.
+<!-- profile:inbound-webhooks-standard:end -->
+
+<!-- profile:messaging-nats-jetstream:start -->
+NATS JetStream uses a separate `cmd/worker` root and concrete
+`internal/infra/natsjs` adapter behind transport-neutral typed events. Business
+code sees only event kinds, publishers, and typed handlers; composition owns
+subjects and the worker owns duplicate-safe settlement. With outbox enabled, the
+same package restores stored W3C creation context and publishes the stored event
+without inventing consumer ordering.
+<!-- profile:messaging-nats-jetstream:end -->
+
+Business behavior stays in `internal/<feature>`, mechanics in
+`internal/infra/<integration>`, and lifecycle/config/telemetry in an explicit
+`cmd/<role>` root. A distinct lifecycle or scaling model earns a separate role,
+run as its own process, instead of a durable loop hidden in an HTTP handler.

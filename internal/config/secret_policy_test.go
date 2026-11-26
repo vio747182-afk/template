@@ -1,0 +1,183 @@
+package config
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestConfigFileRejectsSecretLikeValues(t *testing.T) {
+	resetConfigEnv(t)
+	path := writeTempConfig(t, `
+app:
+  env: prod
+postgres:
+  enabled: true
+  dsn: "postgres://app:secret@localhost:5432/app?sslmode=disable"
+`)
+
+	_, _, err := Load(t.Context(), LoadOptions{ConfigPath: path})
+	if err == nil {
+		t.Fatal("Load() expected secret source policy rejection")
+	}
+	if !errors.Is(err, ErrSecretPolicy) {
+		t.Fatalf("error = %v, want ErrSecretPolicy", err)
+	}
+}
+
+//nolint:paralleltest // resetConfigEnv mutates process-wide configuration environment.
+func TestConfigFileAllowsNonSecretValuesAndEmptySecretLikePlaceholders(t *testing.T) {
+	resetConfigEnv(t)
+
+	path := writeTempConfig(t, `
+# profile:authn-bearer:start
+authn:
+  token_profile: "resource-server"
+# profile:authn-bearer:end
+# profile:database-postgres:start
+postgres:
+  dsn: ""
+# profile:database-postgres:end
+observability:
+  otel:
+    exporter:
+      otlp_headers: ""
+`)
+
+	if _, _, err := Load(t.Context(), LoadOptions{ConfigPath: path}); err != nil {
+		t.Fatalf("Load() error = %v, want nil for empty secret-like placeholders", err)
+	}
+}
+
+//nolint:paralleltest // Subtests reset process-wide configuration environment.
+func TestConfigFileRejectsCommonFutureSecretLikeKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantKey string
+	}{
+		{name: "client secret", content: "oauth:\n  client_secret: \"secret\"\n", wantKey: "oauth.client_secret"},
+		{name: "jwt secret", content: "security:\n  jwt_secret: \"secret\"\n", wantKey: "security.jwt_secret"},
+		{name: "api key", content: "provider:\n  api_key: \"secret\"\n", wantKey: "provider.api_key"},
+		{name: "private key", content: "tls:\n  private_key: \"secret\"\n", wantKey: "tls.private_key"},
+		{name: "top level token", content: "token: \"secret\"\n", wantKey: "token"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetConfigEnv(t)
+
+			path := writeTempConfig(t, tt.content)
+			_, _, err := Load(t.Context(), LoadOptions{ConfigPath: path})
+			if err == nil {
+				t.Fatalf("Load() expected secret policy rejection for %s", tt.wantKey)
+			}
+			if !errors.Is(err, ErrSecretPolicy) {
+				t.Fatalf("error = %v, want ErrSecretPolicy", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantKey) {
+				t.Fatalf("error = %v, want rejected key %q", err, tt.wantKey)
+			}
+		})
+	}
+}
+
+func TestSecretLikeConfigKeyPolicy(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		key  string
+		want bool
+	}{
+		{key: "http.addr"},
+		{key: "metadata.public_key"},
+		{key: "authn.token_profile"},
+		{key: "integrations.billing.oauth.token_url"},
+		{key: "provider.access_token", want: true},
+		{key: "provider.client_secret", want: true},
+		{key: "provider.token_url.secret", want: true},
+		{key: "postgres.dsn", want: true},
+		{key: "observability.otel.exporter.otlp_headers", want: true},
+	} {
+		if got := isSecretLikeConfigKey(testCase.key); got != testCase.want {
+			t.Fatalf("isSecretLikeConfigKey(%q) = %t, want %t", testCase.key, got, testCase.want)
+		}
+	}
+}
+
+// profile:outbound-auth-oauth2-client-credentials:start
+//
+//nolint:paralleltest // resetConfigEnv mutates process-wide configuration environment.
+func TestNamedOAuthSecretSourcePolicy(t *testing.T) {
+	resetConfigEnv(t)
+	const canary = "outbound-client-secret-canary"
+	path := writeTempConfig(t, "integrations:\n  billing:\n    oauth:\n      client_secret: "+canary+"\n")
+	_, _, err := Load(t.Context(), LoadOptions{ConfigPath: path})
+	if !errors.Is(err, ErrSecretPolicy) {
+		t.Fatalf("Load() error = %v, want ErrSecretPolicy", err)
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Fatalf("Load() error disclosed client secret: %v", err)
+	}
+
+	resetConfigEnv(t)
+	t.Setenv("OAUTH_CLIENT_SECRET", canary)
+	_, _, err = Load(t.Context(), LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load() with hostile ambient variable error = %v", err)
+	}
+}
+
+// profile:outbound-auth-oauth2-client-credentials:end
+
+// profile:webhooks-durable:start
+//
+//nolint:paralleltest // resetConfigEnv mutates process-wide configuration environment.
+func TestWebhookSecretSourcePolicy(t *testing.T) {
+	resetConfigEnv(t)
+	const canary = "webhook-secret-canary"
+	path := writeTempConfig(t, "webhooks:\n  static_secrets: "+canary+"\n")
+	_, _, err := Load(t.Context(), LoadOptions{ConfigPath: path})
+	if !errors.Is(err, ErrSecretPolicy) {
+		t.Fatalf("Load() error = %v, want ErrSecretPolicy", err)
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Fatalf("Load() error disclosed webhook secret: %v", err)
+	}
+
+	resetConfigEnv(t)
+	path = writeTempConfig(t, "webhooks:\n  static_secrets: \"\"\n")
+	if _, _, err := Load(t.Context(), LoadOptions{ConfigPath: path}); err != nil {
+		t.Fatalf("Load() with empty placeholder error = %v", err)
+	}
+
+	resetConfigEnv(t)
+	t.Setenv("APP__WEBHOOKS__STATIC_SECRETS", canary)
+	cfg, _, err := Load(t.Context(), LoadOptions{})
+	if err != nil {
+		t.Fatalf("Load() with environment webhook secret error = %v", err)
+	}
+	if cfg.OutboundWebhooks.StaticSecrets != canary {
+		t.Fatal("Load() did not accept environment webhook secret")
+	}
+}
+
+// profile:webhooks-durable:end
+
+// profile:inbound-webhooks-standard:start
+//
+//nolint:paralleltest // resetConfigEnv mutates process-wide configuration environment.
+func TestInboundWebhookSecretSourcePolicy(t *testing.T) {
+	resetConfigEnv(t)
+	const canary = "inbound-secret-canary"
+	path := writeTempConfig(t, "inbound_webhooks:\n  static_secrets: "+canary+"\n")
+	_, _, err := Load(t.Context(), LoadOptions{ConfigPath: path})
+	if !errors.Is(err, ErrSecretPolicy) {
+		t.Fatalf("Load() error = %v, want ErrSecretPolicy", err)
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Fatalf("Load() error disclosed inbound secret: %v", err)
+	}
+}
+
+// profile:inbound-webhooks-standard:end

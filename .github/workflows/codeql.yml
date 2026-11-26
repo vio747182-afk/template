@@ -1,0 +1,149 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+    tags: [v*]
+  pull_request:
+    branches: [main]
+  merge_group:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOMODCACHE: ${{ github.workspace }}/.cache/gomod/root
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go_source: ${{ steps.surfaces.outputs.go_source }}
+      go_handwritten: ${{ steps.surfaces.outputs.go_handwritten }}
+      go_root_dependencies: ${{ steps.surfaces.outputs.go_root_dependencies }}
+      github_workflows: ${{ steps.surfaces.outputs.github_workflows }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Classify changed surfaces
+        id: surfaces
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == schedule || "${EVENT_NAME}" == workflow_dispatch || "${GITHUB_REF}" == refs/tags/* ]]; then
+            bash ./scripts/ci/changed-surfaces.sh --all >>"${GITHUB_OUTPUT}"
+          elif [[ -n "${BASE_SHA}" && "${BASE_SHA}" != 0000000000000000000000000000000000000000 ]]; then
+            git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+            git diff --name-only "${BASE_SHA}" HEAD | bash ./scripts/ci/changed-surfaces.sh --union "${BASE_SHA}" >>"${GITHUB_OUTPUT}"
+          else
+            bash ./scripts/ci/changed-surfaces.sh --all >>"${GITHUB_OUTPUT}"
+          fi
+
+  analyze-actions:
+    needs: changes
+    if: needs.changes.outputs.github_workflows == 'true'
+    name: Analyze (actions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: actions
+          build-mode: none
+          queries: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'security-extended' || 'security-and-quality' }}
+      - name: Analyze
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+
+  analyze-go:
+    needs: changes
+    if: needs.changes.outputs.go_handwritten == 'true' || needs.changes.outputs.go_root_dependencies == 'true'
+    name: Analyze (go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore downloaded Go modules
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: go-mod-root-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: go-mod-root-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore Go build cache
+        # The traced build and the extractor's package loading reuse the
+        # build CI saves on main; only CI writes it.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-go.outputs.go-version }}-
+      - name: Move Go modules outside the source root
+        # The restore path must match the one CI saves, but CodeQL reports
+        # every Go file under the checkout, dependency sources included.
+        run: |
+          set -euo pipefail
+          target="${RUNNER_TEMP}/gomod"
+          if [[ -d "${GOMODCACHE}" ]]; then
+            mv "${GOMODCACHE}" "${target}"
+          fi
+          echo "GOMODCACHE=${target}" >>"${GITHUB_ENV}"
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: go
+          build-mode: manual
+          queries: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'security-extended' || 'security-and-quality' }}
+      - name: Build Go packages
+        env:
+          GOFLAGS: -mod=readonly
+        run: bash ./scripts/ci/measure.sh codeql-go-build -- go build ./...
+      - name: Analyze
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+
+  codeql-required:
+    if: always()
+    needs: [changes, analyze-actions, analyze-go]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Reject failed or cancelled analyses
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - name: Accept applicable analyses
+        run: echo "all applicable CodeQL analyses passed"

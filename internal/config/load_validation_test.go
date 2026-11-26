@@ -1,0 +1,112 @@
+package config
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestOverlayUnknownKeyRejects(t *testing.T) {
+	resetConfigEnv(t)
+
+	overlayPath := writeTempConfig(t, `
+unknown:
+  field: value
+`)
+
+	_, _, err := Load(t.Context(), LoadOptions{
+		ConfigOverlays: []string{overlayPath},
+	})
+	if err == nil {
+		t.Fatal("Load() expected unknown overlay key error")
+	}
+	if !errors.Is(err, ErrUnknownKey) {
+		t.Fatalf("error = %v, want ErrUnknownKey", err)
+	}
+}
+
+func TestUnknownKeyRejectsScalarSectionKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		envKey  string
+		wantKey string
+	}{
+		{name: "root section", envKey: "APP__HTTP", wantKey: "http"},
+		{name: "nested section", envKey: "APP__OBSERVABILITY__OTEL", wantKey: "observability.otel"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetConfigEnv(t)
+			t.Setenv(tc.envKey, "oops")
+
+			_, report, err := Load(t.Context(), LoadOptions{})
+			if err == nil {
+				t.Fatal("Load() expected unknown key error")
+			}
+			if !errors.Is(err, ErrUnknownKey) {
+				t.Fatalf("error = %v, want ErrUnknownKey", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantKey) {
+				t.Fatalf("error = %v, want unknown section key %q", err, tc.wantKey)
+			}
+			if report.FailedStage != StageValidate {
+				t.Fatalf("FailedStage = %q, want %q", report.FailedStage, StageValidate)
+			}
+		})
+	}
+}
+
+//nolint:paralleltest // resetConfigEnv mutates process-wide configuration environment.
+func TestScalarSectionRejects(t *testing.T) {
+	resetConfigEnv(t)
+
+	configPath := writeTempConfig(t, `
+http: oops
+`)
+
+	_, _, err := Load(t.Context(), LoadOptions{ConfigPath: configPath})
+	if err == nil {
+		t.Fatal("Load() error = nil, want unknown key error")
+	}
+	if !errors.Is(err, ErrUnknownKey) {
+		t.Fatalf("error = %v, want ErrUnknownKey", err)
+	}
+}
+
+// profile:database-postgres:start
+//
+//nolint:paralleltest // This test mutates process-global environment or working directory.
+func TestTST003RequiredIfEnabledContracts(t *testing.T) {
+	t.Run("postgres_enabled_without_dsn_rejected", func(t *testing.T) {
+		resetConfigEnv(t)
+		t.Setenv("APP__POSTGRES__ENABLED", "true")
+
+		_, _, err := Load(t.Context(), LoadOptions{})
+		if err == nil {
+			t.Fatal("Load() expected secret policy error")
+		}
+		if !errors.Is(err, ErrSecretPolicy) {
+			t.Fatalf("error = %v, want ErrSecretPolicy", err)
+		}
+	})
+
+	t.Run("postgres_enabled_with_dsn_allowed", func(t *testing.T) {
+		resetConfigEnv(t)
+		// #nosec G101 -- Fixed configuration fixture; no database connection is opened.
+		dsn := "postgres://app:app@localhost:5432/app?sslmode=disable"
+		t.Setenv("APP__POSTGRES__ENABLED", "true")
+		t.Setenv("APP__POSTGRES__DSN", dsn)
+
+		cfg, _, err := Load(t.Context(), LoadOptions{})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.Postgres.Enabled {
+			t.Fatal("Postgres.Enabled = false, want true")
+		}
+		if cfg.Postgres.DSN != dsn {
+			t.Fatalf("Postgres.DSN = %q, want %q", cfg.Postgres.DSN, dsn)
+		}
+	})
+}
+
+// profile:database-postgres:end
